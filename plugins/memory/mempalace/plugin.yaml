@@ -1,0 +1,9 @@
+name: mempalace
+version: 1.0.0
+description: "Local MemPalace-backed Hermes memory provider with profile-scoped storage and wing-filtered recall."
+pip_dependencies:
+  - mempalace
+hooks:
+  - on_turn_start
+  - on_session_end
+  - on_memory_write
