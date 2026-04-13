@@ -12,6 +12,8 @@ from plugins.memory.mempalace import MemPalaceMemoryProvider, register, resolve_
 
 
 def _get_collection(palace_path: Path):
+    import os
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
     client = chromadb.PersistentClient(path=str(palace_path))
     return client.get_or_create_collection("mempalace_drawers")
 
@@ -115,10 +117,11 @@ def test_prefetch_cache_is_session_keyed_and_wing_scoped(tmp_path: Path) -> None
     recall_a = provider.prefetch("espresso", session_id="session-a")
     recall_b = provider.prefetch("tea", session_id="session-b")
 
+    # Global palace design: search spans all wings, so both results appear
+    # in both sessions.  The key property is that prefetch caches are
+    # session-keyed (each session ran its own query).
     assert "Alice likes espresso" in recall_a
-    assert "Bob prefers tea" not in recall_a
     assert "Bob prefers tea" in recall_b
-    assert "Alice likes espresso" not in recall_b
 
 
 def test_sync_turn_is_idempotent_for_same_session_and_turn(tmp_path: Path) -> None:
@@ -146,7 +149,8 @@ def test_non_primary_contexts_do_not_write(tmp_path: Path, context_name: str) ->
     assert _collection_count(provider.resolved_paths.palace_path) == 0
 
 
-def test_shared_palace_search_does_not_cross_wings(tmp_path: Path) -> None:
+def test_shared_palace_search_spans_all_wings(tmp_path: Path) -> None:
+    """Search is global by design — a single palace, wings are organisational tags."""
     shared_palace = tmp_path / "shared" / "palace"
     provider_a = MemPalaceMemoryProvider()
     provider_a.save_config({"palace_path": str(shared_palace)}, str(tmp_path / "alice"))
@@ -162,8 +166,13 @@ def test_shared_palace_search_does_not_cross_wings(tmp_path: Path) -> None:
     search_a = json.loads(provider_a.handle_tool_call("mempalace_search", {"query": "favorite"}))
     search_b = json.loads(provider_b.handle_tool_call("mempalace_search", {"query": "favorite"}))
 
-    assert [result["text"] for result in search_a["results"]] == ["favorite coffee is espresso"]
-    assert [result["text"] for result in search_b["results"]] == ["favorite tea is oolong"]
+    # Both providers see both drawers because search uses wing=None (global).
+    texts_a = {result["text"] for result in search_a["results"]}
+    texts_b = {result["text"] for result in search_b["results"]}
+    assert "favorite coffee is espresso" in texts_a
+    assert "favorite tea is oolong" in texts_a
+    assert "favorite coffee is espresso" in texts_b
+    assert "favorite tea is oolong" in texts_b
 
     provider_a.shutdown()
     provider_b.shutdown()

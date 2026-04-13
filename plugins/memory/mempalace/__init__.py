@@ -322,6 +322,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self._agent_identity = ""
         self._platform = "cli"
         self._user_id = ""
+        self._chroma_client: Any = None
+        self._chroma_lock = threading.Lock()
+        self._cached_config: Optional[Dict[str, Any]] = None
 
     @property
     def name(self) -> str:
@@ -398,6 +401,14 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self._paths.identity_path.parent.mkdir(parents=True, exist_ok=True)
         self._paths.kg_path.parent.mkdir(parents=True, exist_ok=True)
         self._paths.identity_path.touch(exist_ok=True)
+
+        # Cache config from mempalace.json once at init time.
+        self._cached_config = {}
+        if self._paths.config_path.exists():
+            try:
+                self._cached_config = json.loads(self._paths.config_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
 
         self._default_session_id = session_id
         self._current_session_id = session_id
@@ -600,6 +611,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         for session_id in list(self._sessions):
             self._flush_session(session_id)
         self._executor.shutdown(wait=True, cancel_futures=False)
+        self._chroma_client = None
 
     def _ensure_session_state(self, session_id: str, **kwargs) -> SessionState:
         if not session_id:
@@ -624,13 +636,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         platform = str(kwargs.get("platform") or state.platform or self._platform)
 
         # Allow wing override from mempalace.json config (e.g. "default_wing": "solvely_web")
-        config_wing = None
-        if self._paths and self._paths.config_path.exists():
-            try:
-                _cfg = json.loads(self._paths.config_path.read_text())
-                config_wing = _cfg.get("default_wing")
-            except (json.JSONDecodeError, OSError):
-                pass
+        # Uses cached config read at initialize() time — no per-call file I/O.
+        config_wing = (self._cached_config or {}).get("default_wing")
         if config_wing:
             wing = _safe_wing_name(config_wing)
         else:
@@ -735,10 +742,16 @@ class MemPalaceMemoryProvider(MemoryProvider):
     def _get_collection(self, *, create: bool):
         if chromadb is None or self._paths is None:
             raise RuntimeError("MemPalace provider is unavailable")
-        client = chromadb.PersistentClient(path=str(self._paths.palace_path))
+        with self._chroma_lock:
+            if self._chroma_client is None:
+                import os
+                os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+                self._chroma_client = chromadb.PersistentClient(
+                    path=str(self._paths.palace_path),
+                )
         if create:
-            return client.get_or_create_collection(COLLECTION_NAME)
-        return client.get_collection(COLLECTION_NAME)
+            return self._chroma_client.get_or_create_collection(COLLECTION_NAME)
+        return self._chroma_client.get_collection(COLLECTION_NAME)
 
     def _content_drawer_id(self, wing: str, room: str, content: str) -> str:
         digest = hashlib.sha256(f"{wing}:{room}:{content}".encode("utf-8")).hexdigest()[:24]
