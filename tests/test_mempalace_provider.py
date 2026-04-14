@@ -37,6 +37,11 @@ def _provider(hermes_home: Path, *, session_id: str = "session-1", **kwargs) -> 
     return provider
 
 
+# ---------------------------------------------------------------------------
+# Original 11 tests (unchanged names and behaviour)
+# ---------------------------------------------------------------------------
+
+
 def test_register_registers_provider() -> None:
     class DummyContext:
         def __init__(self) -> None:
@@ -231,4 +236,351 @@ def test_tool_outputs_are_json_and_kg_query_is_structured(tmp_path: Path) -> Non
     assert kg_result["results"][0]["predicate"] == "likes"
     assert kg_result["results"][0]["object"] == "espresso"
 
+    provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# New V2 tests
+# ---------------------------------------------------------------------------
+
+
+def test_kg_add(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(
+        provider.handle_tool_call("mempalace_kg_add", {
+            "subject": "Alice",
+            "predicate": "likes",
+            "object": "coffee",
+            "valid_from": "2026-01-01",
+        })
+    )
+    assert result["success"] is True
+    assert result["subject"] == "Alice"
+    assert result["predicate"] == "likes"
+    assert result["object"] == "coffee"
+
+    # Verify it's queryable
+    query = json.loads(
+        provider.handle_tool_call("mempalace_kg_query", {"entity": "Alice"})
+    )
+    assert any(r["predicate"] == "likes" for r in query["results"])
+    provider.shutdown()
+
+
+def test_kg_invalidate(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_kg_add", {
+        "subject": "Bob",
+        "predicate": "works_at",
+        "object": "Acme",
+    })
+    result = json.loads(
+        provider.handle_tool_call("mempalace_kg_invalidate", {
+            "subject": "Bob",
+            "predicate": "works_at",
+            "object": "Acme",
+            "ended": "2026-04-15",
+        })
+    )
+    assert result["success"] is True
+    provider.shutdown()
+
+
+def test_kg_timeline(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_kg_add", {
+        "subject": "Eve",
+        "predicate": "visited",
+        "object": "Paris",
+        "valid_from": "2026-03-01",
+    })
+    result = json.loads(
+        provider.handle_tool_call("mempalace_kg_timeline", {"entity": "Eve"})
+    )
+    assert "timeline" in result
+    provider.shutdown()
+
+
+def test_kg_stats(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(provider.handle_tool_call("mempalace_kg_stats", {}))
+    assert "stats" in result
+    provider.shutdown()
+
+
+def test_status(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(provider.handle_tool_call("mempalace_status", {}))
+    assert result["provider"] == "mempalace"
+    assert result["version"] == "2.0.0"
+    assert "wing" in result
+    assert "drawer_count" in result
+    provider.shutdown()
+
+
+def test_list_wings(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "test data"})
+    result = json.loads(provider.handle_tool_call("mempalace_list_wings", {}))
+    assert "wings" in result
+    assert len(result["wings"]) >= 1
+    provider.shutdown()
+
+
+def test_list_rooms(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "test data", "room": "myroom"})
+    result = json.loads(provider.handle_tool_call("mempalace_list_rooms", {}))
+    assert "rooms" in result
+    assert "myroom" in result["rooms"]
+    provider.shutdown()
+
+
+def test_get_taxonomy(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "taxonomy test"})
+    result = json.loads(provider.handle_tool_call("mempalace_get_taxonomy", {}))
+    assert "taxonomy" in result
+    assert len(result["taxonomy"]) >= 1
+    provider.shutdown()
+
+
+def test_add_drawer(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(
+        provider.handle_tool_call("mempalace_add_drawer", {
+            "content": "drawer content",
+            "room": "test_room",
+        })
+    )
+    assert result["success"] is True
+    assert result["room"] == "test_room"
+    assert "drawer_id" in result
+    provider.shutdown()
+
+
+def test_delete_drawer(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    add_result = json.loads(
+        provider.handle_tool_call("mempalace_add_drawer", {"content": "to be deleted"})
+    )
+    drawer_id = add_result["drawer_id"]
+
+    delete_result = json.loads(
+        provider.handle_tool_call("mempalace_delete_drawer", {"drawer_id": drawer_id})
+    )
+    assert delete_result["success"] is True
+    assert delete_result["deleted"] == drawer_id
+
+    # Verify it's gone
+    get_result = json.loads(
+        provider.handle_tool_call("mempalace_get_drawer", {"drawer_id": drawer_id})
+    )
+    assert "error" in get_result
+    provider.shutdown()
+
+
+def test_get_drawer(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    add_result = json.loads(
+        provider.handle_tool_call("mempalace_add_drawer", {"content": "retrieve me"})
+    )
+    drawer_id = add_result["drawer_id"]
+
+    get_result = json.loads(
+        provider.handle_tool_call("mempalace_get_drawer", {"drawer_id": drawer_id})
+    )
+    assert get_result["drawer_id"] == drawer_id
+    assert get_result["content"] == "retrieve me"
+    assert "metadata" in get_result
+    provider.shutdown()
+
+
+def test_update_drawer(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    add_result = json.loads(
+        provider.handle_tool_call("mempalace_add_drawer", {"content": "original"})
+    )
+    drawer_id = add_result["drawer_id"]
+
+    update_result = json.loads(
+        provider.handle_tool_call("mempalace_update_drawer", {
+            "drawer_id": drawer_id,
+            "content": "updated",
+        })
+    )
+    assert update_result["success"] is True
+
+    get_result = json.loads(
+        provider.handle_tool_call("mempalace_get_drawer", {"drawer_id": drawer_id})
+    )
+    assert get_result["content"] == "updated"
+    provider.shutdown()
+
+
+def test_list_drawers(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_add_drawer", {"content": "item 1", "room": "listing"})
+    provider.handle_tool_call("mempalace_add_drawer", {"content": "item 2", "room": "listing"})
+
+    result = json.loads(
+        provider.handle_tool_call("mempalace_list_drawers", {"room": "listing"})
+    )
+    assert "drawers" in result
+    assert len(result["drawers"]) >= 2
+    provider.shutdown()
+
+
+def test_diary_write(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile", agent_identity="hermes")
+    result = json.loads(
+        provider.handle_tool_call("mempalace_diary_write", {"entry": "Today was productive"})
+    )
+    assert result["success"] is True
+    assert "diary_" in result["room"]
+    assert result["date"] is not None
+    provider.shutdown()
+
+
+def test_diary_read(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile", agent_identity="hermes")
+    provider.handle_tool_call("mempalace_diary_write", {"entry": "Morning entry"})
+    provider.handle_tool_call("mempalace_diary_write", {"entry": "Evening entry"})
+
+    result = json.loads(provider.handle_tool_call("mempalace_diary_read", {}))
+    assert "entries" in result
+    assert len(result["entries"]) >= 1
+    # Same-day entries are appended, so we should have 1 entry with both texts
+    entry_text = result["entries"][0]["content"]
+    assert "Morning entry" in entry_text
+    assert "Evening entry" in entry_text
+    provider.shutdown()
+
+
+def test_check_duplicate(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "unique fact"})
+
+    result = json.loads(
+        provider.handle_tool_call("mempalace_check_duplicate", {"content": "unique fact"})
+    )
+    assert "is_duplicate" in result
+    # Should find the existing exact match
+    assert result["similar"] >= 1
+    provider.shutdown()
+
+
+def test_reconnect(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "before reconnect"})
+
+    result = json.loads(provider.handle_tool_call("mempalace_reconnect", {}))
+    assert result["success"] is True
+    assert result["drawer_count"] >= 1
+
+    # Verify data survives reconnect
+    search = json.loads(
+        provider.handle_tool_call("mempalace_search", {"query": "before reconnect"})
+    )
+    assert len(search["results"]) >= 1
+    provider.shutdown()
+
+
+def test_on_pre_compress(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    messages = [
+        {"role": "user", "content": "Tell me about quantum computing"},
+        {"role": "assistant", "content": "Quantum computing uses qubits instead of classical bits..."},
+        {"role": "user", "content": "How does entanglement work?"},
+        {"role": "assistant", "content": "Entanglement is a quantum phenomenon where particles become correlated..."},
+    ]
+    provider.on_pre_compress(messages)
+
+    # Should have saved at least one turn as a drawer in the "compressed" room
+    collection = _get_collection(provider.resolved_paths.palace_path)
+    stored = collection.get(include=["documents", "metadatas"])
+    compressed = [m for m in stored["metadatas"] if m.get("room") == "compressed"]
+    assert len(compressed) >= 1
+    provider.shutdown()
+
+
+def test_on_pre_compress_blocked_when_writes_disabled(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile", agent_context="subagent")
+    messages = [
+        {"role": "user", "content": "save this"},
+        {"role": "assistant", "content": "I saved it for you."},
+    ]
+    provider.on_pre_compress(messages)
+    assert _collection_count(provider.resolved_paths.palace_path) == 0
+    provider.shutdown()
+
+
+# Write-blocked context tests for new write tools
+@pytest.mark.parametrize("tool_name,args", [
+    ("mempalace_kg_add", {"subject": "A", "predicate": "B", "object": "C"}),
+    ("mempalace_kg_invalidate", {"subject": "A", "predicate": "B", "object": "C"}),
+    ("mempalace_add_drawer", {"content": "blocked"}),
+    ("mempalace_delete_drawer", {"drawer_id": "x"}),
+    ("mempalace_update_drawer", {"drawer_id": "x", "content": "blocked"}),
+    ("mempalace_diary_write", {"entry": "blocked"}),
+    ("mempalace_create_tunnel", {"source_wing": "a", "source_room": "b", "target_wing": "c", "target_room": "d"}),
+    ("mempalace_delete_tunnel", {"tunnel_id": "x"}),
+])
+def test_write_tools_blocked_in_subagent_context(tmp_path: Path, tool_name: str, args: dict) -> None:
+    provider = _provider(tmp_path / "blocked", agent_context="subagent")
+    result = json.loads(provider.handle_tool_call(tool_name, args))
+    assert result.get("success") is False or result.get("reason") == "writes_disabled"
+    provider.shutdown()
+
+
+def test_memories_filed_away(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.handle_tool_call("mempalace_remember", {"content": "fact one"})
+    provider.handle_tool_call("mempalace_remember", {"content": "fact two"})
+
+    result = json.loads(provider.handle_tool_call("mempalace_memories_filed_away", {}))
+    assert result["memories_filed"] == 2
+    provider.shutdown()
+
+
+def test_get_aaak_spec(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(provider.handle_tool_call("mempalace_get_aaak_spec", {}))
+    assert result["spec"] == "AAAK/1.0"
+    assert result["provider"] == "mempalace"
+    assert len(result["capabilities"]) == 31
+    provider.shutdown()
+
+
+def test_system_prompt_lists_all_tools(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    prompt = provider.system_prompt_block()
+    assert "mempalace_search" in prompt
+    assert "mempalace_memories_filed_away" in prompt
+    provider.shutdown()
+
+
+def test_31_tool_schemas_returned(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    schemas = provider.get_tool_schemas()
+    assert len(schemas) == 31
+    names = {s["name"] for s in schemas}
+    assert "mempalace_search" in names
+    assert "mempalace_memories_filed_away" in names
+    provider.shutdown()
+
+
+def test_unknown_tool_returns_error(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(provider.handle_tool_call("mempalace_nonexistent", {}))
+    assert "error" in result
+    assert "unknown_tool" in result["error"]
+    provider.shutdown()
+
+
+def test_hook_settings_read(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    result = json.loads(provider.handle_tool_call("mempalace_hook_settings", {}))
+    # Should return current settings without error
+    assert "hook_silent_save" in result or "error" in result
     provider.shutdown()

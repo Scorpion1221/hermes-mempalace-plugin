@@ -1,9 +1,10 @@
 name: mempalace
-version: 1.0.0
-description: "Local MemPalace-backed Hermes memory provider with profile-scoped storage and wing-filtered recall."
+version: 2.0.0
+description: "Local MemPalace-backed Hermes memory provider with profile-scoped storage, 31 tools, knowledge graph, palace graph tunnels, diary, and wing-filtered recall."
 pip_dependencies:
-  - mempalace
+  - "mempalace>=3.3.0"
 hooks:
   - on_turn_start
   - on_session_end
   - on_memory_write
+  - on_pre_compress

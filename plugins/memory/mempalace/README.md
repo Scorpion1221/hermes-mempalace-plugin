@@ -1,6 +1,6 @@
-# MemPalace Memory Provider
+# MemPalace Memory Provider v2.0
 
-Local Hermes memory provider backed by the published `mempalace` Python package.
+Local Hermes memory provider backed by the published `mempalace>=3.3.0` Python package.
 
 This implementation is designed to be copied into the Hermes monorepo as:
 
@@ -11,14 +11,20 @@ plugins/memory/mempalace/
 The current repository is only the development workspace. The final production
 landing point remains the Hermes repository.
 
-## What V1 Does
+## What V2 Does
 
 - stores completed turns as MemPalace drawers in the active wing
 - keeps all provider paths explicit and profile-scoped by default
 - mirrors Hermes built-in memory writes into the `builtin_memory` room
-- exposes `mempalace_search`, `mempalace_kg_query`, and `mempalace_remember`
+- exposes **31 tools** covering search, knowledge graph, palace graph, drawers, diary, and more
 - keeps session caches keyed by `session_id` to avoid concurrent-session bleed
 - blocks durable writes in `subagent`, `cron`, and `flush` contexts
+- `on_pre_compress` hook saves recent turns before context compression discards them
+- dispatch-table architecture for tool handling (no if/elif chains)
+- `_safe_content()` helper using `sanitize_content` from mempalace
+- `_bounded_int()` helper for clamped integer parsing
+- `_get_collection(create=False)` returns `None` instead of raising when collection doesn't exist
+- `_json_result` uses `default=str` for safe datetime serialization
 
 ## Default Paths
 
@@ -56,13 +62,75 @@ Optional non-secret config file:
 
 Relative config paths are resolved from the active `HERMES_HOME`.
 
-## Tools
+## Tools (31 total)
 
+### Search & Recall
 | Tool | Description |
 |------|-------------|
-| `mempalace_search` | semantic search over drawers in the active wing |
-| `mempalace_kg_query` | query temporal facts from the profile-scoped KG |
-| `mempalace_remember` | explicitly persist a durable memory drawer |
+| `mempalace_search` | Semantic search over drawers in the active wing |
+| `mempalace_kg_query` | Query temporal facts from the profile-scoped KG |
+| `mempalace_remember` | Explicitly persist a durable memory drawer |
+
+### Knowledge Graph
+| Tool | Description |
+|------|-------------|
+| `mempalace_kg_add` | Add a triple (subject, predicate, object) to the KG |
+| `mempalace_kg_invalidate` | End-date a triple in the KG |
+| `mempalace_kg_timeline` | Temporal timeline of an entity |
+| `mempalace_kg_stats` | KG statistics |
+
+### Palace Status & Taxonomy
+| Tool | Description |
+|------|-------------|
+| `mempalace_status` | Current provider status, paths, wing info |
+| `mempalace_list_wings` | List all wings with counts |
+| `mempalace_list_rooms` | List rooms, optionally filtered by wing |
+| `mempalace_get_taxonomy` | Full wing/room taxonomy with counts |
+
+### Palace Graph (Tunnels)
+| Tool | Description |
+|------|-------------|
+| `mempalace_traverse` | Graph traversal from a starting room |
+| `mempalace_find_tunnels` | Find tunnels connecting two wings |
+| `mempalace_graph_stats` | Palace graph statistics |
+| `mempalace_create_tunnel` | Create a tunnel between rooms |
+| `mempalace_list_tunnels` | List tunnels, filtered by wing |
+| `mempalace_delete_tunnel` | Delete a tunnel by ID |
+| `mempalace_follow_tunnels` | Follow tunnels from a wing/room |
+
+### Drawer Management
+| Tool | Description |
+|------|-------------|
+| `mempalace_add_drawer` | Add a new drawer |
+| `mempalace_delete_drawer` | Delete a drawer by ID |
+| `mempalace_get_drawer` | Retrieve a specific drawer |
+| `mempalace_list_drawers` | List drawers with optional filters |
+| `mempalace_update_drawer` | Update drawer content |
+
+### Diary
+| Tool | Description |
+|------|-------------|
+| `mempalace_diary_write` | Write a diary entry (appends to same-day) |
+| `mempalace_diary_read` | Read recent diary entries |
+
+### Utilities
+| Tool | Description |
+|------|-------------|
+| `mempalace_check_duplicate` | Check if content already exists |
+| `mempalace_check_facts` | Fact-check text against stored knowledge |
+| `mempalace_hook_settings` | Get/set hook settings |
+| `mempalace_reconnect` | Reconnect ChromaDB client |
+| `mempalace_get_aaak_spec` | AAAK specification |
+| `mempalace_memories_filed_away` | Count of memories filed this session |
+
+## Hooks
+
+| Hook | Description |
+|------|-------------|
+| `on_turn_start` | Set up session state for the new turn |
+| `on_session_end` | Flush queued writes |
+| `on_memory_write` | Mirror built-in memory writes |
+| `on_pre_compress` | Save recent turns before context compression |
 
 ## CLI
 

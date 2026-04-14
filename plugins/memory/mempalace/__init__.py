@@ -1,4 +1,4 @@
-"""Hermes MemPalace memory provider.
+"""Hermes MemPalace memory provider v2.0.
 
 This repository mirrors the final in-tree Hermes plugin layout so the directory
 can be copied into ``plugins/memory/mempalace/`` in the Hermes monorepo.
@@ -22,13 +22,38 @@ except ImportError:  # pragma: no cover - handled by is_available()
     chromadb = None
 
 try:
-    from mempalace.config import sanitize_name
+    from mempalace.config import sanitize_content, sanitize_name
     from mempalace.knowledge_graph import KnowledgeGraph
     from mempalace.searcher import search_memories
 except ImportError:  # pragma: no cover - handled by is_available()
     KnowledgeGraph = None
     sanitize_name = None
+    sanitize_content = None
     search_memories = None
+
+try:
+    from mempalace.palace_graph import (
+        create_tunnel,
+        delete_tunnel,
+        find_tunnels,
+        follow_tunnels,
+        graph_stats,
+        list_tunnels,
+        traverse,
+    )
+except ImportError:  # pragma: no cover
+    create_tunnel = delete_tunnel = find_tunnels = follow_tunnels = None
+    graph_stats = list_tunnels = traverse = None
+
+try:
+    from mempalace.fact_checker import check_text as fact_check_text
+except ImportError:  # pragma: no cover
+    fact_check_text = None
+
+try:
+    from mempalace.config import MempalaceConfig
+except ImportError:  # pragma: no cover
+    MempalaceConfig = None
 
 try:  # Hermes runtime import.
     from agent.memory_provider import MemoryProvider
@@ -58,6 +83,40 @@ TRIVIAL_USER_MESSAGES = {
     "sounds good",
 }
 
+ALL_TOOL_NAMES = [
+    "mempalace_search",
+    "mempalace_kg_query",
+    "mempalace_remember",
+    "mempalace_kg_add",
+    "mempalace_kg_invalidate",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+    "mempalace_status",
+    "mempalace_list_wings",
+    "mempalace_list_rooms",
+    "mempalace_get_taxonomy",
+    "mempalace_traverse",
+    "mempalace_find_tunnels",
+    "mempalace_graph_stats",
+    "mempalace_create_tunnel",
+    "mempalace_list_tunnels",
+    "mempalace_delete_tunnel",
+    "mempalace_follow_tunnels",
+    "mempalace_add_drawer",
+    "mempalace_delete_drawer",
+    "mempalace_get_drawer",
+    "mempalace_list_drawers",
+    "mempalace_update_drawer",
+    "mempalace_diary_write",
+    "mempalace_diary_read",
+    "mempalace_check_duplicate",
+    "mempalace_check_facts",
+    "mempalace_hook_settings",
+    "mempalace_reconnect",
+    "mempalace_get_aaak_spec",
+    "mempalace_memories_filed_away",
+]
+
 
 def _patch_chromadb_pydantic_compat() -> None:
     """Backport Chroma's Pydantic 2.11 compatibility fix for older 0.6.x installs."""
@@ -84,6 +143,10 @@ def _patch_chromadb_pydantic_compat() -> None:
 
 
 _patch_chromadb_pydantic_compat()
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
 
 SEARCH_TOOL_SCHEMA = {
     "name": "mempalace_search",
@@ -160,6 +223,355 @@ REMEMBER_TOOL_SCHEMA = {
     },
 }
 
+KG_ADD_TOOL_SCHEMA = {
+    "name": "mempalace_kg_add",
+    "description": "Add a triple (subject, predicate, object) to the knowledge graph.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "description": "Subject entity."},
+            "predicate": {"type": "string", "description": "Relationship predicate."},
+            "object": {"type": "string", "description": "Object entity."},
+            "valid_from": {"type": "string", "description": "Optional ISO date start."},
+        },
+        "required": ["subject", "predicate", "object"],
+    },
+}
+
+KG_INVALIDATE_TOOL_SCHEMA = {
+    "name": "mempalace_kg_invalidate",
+    "description": "Invalidate (end-date) a triple in the knowledge graph.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "description": "Subject entity."},
+            "predicate": {"type": "string", "description": "Relationship predicate."},
+            "object": {"type": "string", "description": "Object entity."},
+            "ended": {"type": "string", "description": "Optional ISO date of invalidation."},
+        },
+        "required": ["subject", "predicate", "object"],
+    },
+}
+
+KG_TIMELINE_TOOL_SCHEMA = {
+    "name": "mempalace_kg_timeline",
+    "description": "Return the temporal timeline of an entity in the knowledge graph.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Optional entity name. If omitted, returns full timeline."},
+        },
+        "required": [],
+    },
+}
+
+KG_STATS_TOOL_SCHEMA = {
+    "name": "mempalace_kg_stats",
+    "description": "Return statistics about the knowledge graph.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+STATUS_TOOL_SCHEMA = {
+    "name": "mempalace_status",
+    "description": "Return current MemPalace provider status, paths, and wing info.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+LIST_WINGS_TOOL_SCHEMA = {
+    "name": "mempalace_list_wings",
+    "description": "List all wings present in the palace collection.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+LIST_ROOMS_TOOL_SCHEMA = {
+    "name": "mempalace_list_rooms",
+    "description": "List all rooms, optionally filtered by wing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "wing": {"type": "string", "description": "Optional wing filter."},
+        },
+        "required": [],
+    },
+}
+
+GET_TAXONOMY_TOOL_SCHEMA = {
+    "name": "mempalace_get_taxonomy",
+    "description": "Return the full wing/room taxonomy with counts.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+TRAVERSE_TOOL_SCHEMA = {
+    "name": "mempalace_traverse",
+    "description": "Graph traversal from a starting room.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "start_room": {"type": "string", "description": "Room to start traversal from."},
+            "max_hops": {"type": "integer", "description": "Max hops (default 2)."},
+        },
+        "required": ["start_room"],
+    },
+}
+
+FIND_TUNNELS_TOOL_SCHEMA = {
+    "name": "mempalace_find_tunnels",
+    "description": "Find tunnels connecting two wings.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "wing_a": {"type": "string", "description": "First wing."},
+            "wing_b": {"type": "string", "description": "Second wing."},
+        },
+        "required": [],
+    },
+}
+
+GRAPH_STATS_TOOL_SCHEMA = {
+    "name": "mempalace_graph_stats",
+    "description": "Return palace graph statistics (tunnels, rooms, connections).",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+CREATE_TUNNEL_TOOL_SCHEMA = {
+    "name": "mempalace_create_tunnel",
+    "description": "Create a tunnel between two rooms.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_wing": {"type": "string", "description": "Source wing."},
+            "source_room": {"type": "string", "description": "Source room."},
+            "target_wing": {"type": "string", "description": "Target wing."},
+            "target_room": {"type": "string", "description": "Target room."},
+            "label": {"type": "string", "description": "Optional tunnel label."},
+            "source_drawer_id": {"type": "string", "description": "Optional source drawer ID."},
+            "target_drawer_id": {"type": "string", "description": "Optional target drawer ID."},
+        },
+        "required": ["source_wing", "source_room", "target_wing", "target_room"],
+    },
+}
+
+LIST_TUNNELS_TOOL_SCHEMA = {
+    "name": "mempalace_list_tunnels",
+    "description": "List tunnels, optionally filtered by wing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "wing": {"type": "string", "description": "Optional wing filter."},
+        },
+        "required": [],
+    },
+}
+
+DELETE_TUNNEL_TOOL_SCHEMA = {
+    "name": "mempalace_delete_tunnel",
+    "description": "Delete a tunnel by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tunnel_id": {"type": "string", "description": "Tunnel ID to delete."},
+        },
+        "required": ["tunnel_id"],
+    },
+}
+
+FOLLOW_TUNNELS_TOOL_SCHEMA = {
+    "name": "mempalace_follow_tunnels",
+    "description": "Follow tunnels from a wing/room.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "wing": {"type": "string", "description": "Wing to start from."},
+            "room": {"type": "string", "description": "Room to start from."},
+        },
+        "required": ["wing", "room"],
+    },
+}
+
+ADD_DRAWER_TOOL_SCHEMA = {
+    "name": "mempalace_add_drawer",
+    "description": "Add a new drawer to the palace.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Drawer content."},
+            "room": {"type": "string", "description": "Room name (default: general)."},
+            "wing": {"type": "string", "description": "Optional wing override."},
+            "drawer_id": {"type": "string", "description": "Optional custom drawer ID."},
+        },
+        "required": ["content"],
+    },
+}
+
+DELETE_DRAWER_TOOL_SCHEMA = {
+    "name": "mempalace_delete_drawer",
+    "description": "Delete a drawer by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "drawer_id": {"type": "string", "description": "Drawer ID to delete."},
+        },
+        "required": ["drawer_id"],
+    },
+}
+
+GET_DRAWER_TOOL_SCHEMA = {
+    "name": "mempalace_get_drawer",
+    "description": "Retrieve a specific drawer by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "drawer_id": {"type": "string", "description": "Drawer ID to retrieve."},
+        },
+        "required": ["drawer_id"],
+    },
+}
+
+LIST_DRAWERS_TOOL_SCHEMA = {
+    "name": "mempalace_list_drawers",
+    "description": "List drawers, optionally filtered by wing and room.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "wing": {"type": "string", "description": "Optional wing filter."},
+            "room": {"type": "string", "description": "Optional room filter."},
+            "limit": {"type": "integer", "description": "Max results (default 20)."},
+        },
+        "required": [],
+    },
+}
+
+UPDATE_DRAWER_TOOL_SCHEMA = {
+    "name": "mempalace_update_drawer",
+    "description": "Update an existing drawer's content.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "drawer_id": {"type": "string", "description": "Drawer ID to update."},
+            "content": {"type": "string", "description": "New content."},
+        },
+        "required": ["drawer_id", "content"],
+    },
+}
+
+DIARY_WRITE_TOOL_SCHEMA = {
+    "name": "mempalace_diary_write",
+    "description": "Write a diary entry for today. Appends to same-day entry if one exists.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entry": {"type": "string", "description": "Diary entry text."},
+        },
+        "required": ["entry"],
+    },
+}
+
+DIARY_READ_TOOL_SCHEMA = {
+    "name": "mempalace_diary_read",
+    "description": "Read recent diary entries.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max entries to return (default 5)."},
+        },
+        "required": [],
+    },
+}
+
+CHECK_DUPLICATE_TOOL_SCHEMA = {
+    "name": "mempalace_check_duplicate",
+    "description": "Check if content already exists as a drawer (duplicate detection).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Content to check for duplicates."},
+            "room": {"type": "string", "description": "Optional room filter."},
+        },
+        "required": ["content"],
+    },
+}
+
+CHECK_FACTS_TOOL_SCHEMA = {
+    "name": "mempalace_check_facts",
+    "description": "Fact-check text against stored knowledge.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Text to fact-check."},
+        },
+        "required": ["text"],
+    },
+}
+
+HOOK_SETTINGS_TOOL_SCHEMA = {
+    "name": "mempalace_hook_settings",
+    "description": "Get or set MemPalace hook settings (silent_save, desktop_toast).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string", "description": "Setting key to set. Omit to list all."},
+            "value": {"type": "boolean", "description": "Value to set."},
+        },
+        "required": [],
+    },
+}
+
+RECONNECT_TOOL_SCHEMA = {
+    "name": "mempalace_reconnect",
+    "description": "Reconnect the ChromaDB client (useful after errors).",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+GET_AAAK_SPEC_TOOL_SCHEMA = {
+    "name": "mempalace_get_aaak_spec",
+    "description": "Return the AAAK (Agent-Accessible API Keys) specification.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+MEMORIES_FILED_AWAY_TOOL_SCHEMA = {
+    "name": "mempalace_memories_filed_away",
+    "description": "Return the count of memories filed in this session.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+_ALL_TOOL_SCHEMAS = [
+    SEARCH_TOOL_SCHEMA,
+    KG_QUERY_TOOL_SCHEMA,
+    REMEMBER_TOOL_SCHEMA,
+    KG_ADD_TOOL_SCHEMA,
+    KG_INVALIDATE_TOOL_SCHEMA,
+    KG_TIMELINE_TOOL_SCHEMA,
+    KG_STATS_TOOL_SCHEMA,
+    STATUS_TOOL_SCHEMA,
+    LIST_WINGS_TOOL_SCHEMA,
+    LIST_ROOMS_TOOL_SCHEMA,
+    GET_TAXONOMY_TOOL_SCHEMA,
+    TRAVERSE_TOOL_SCHEMA,
+    FIND_TUNNELS_TOOL_SCHEMA,
+    GRAPH_STATS_TOOL_SCHEMA,
+    CREATE_TUNNEL_TOOL_SCHEMA,
+    LIST_TUNNELS_TOOL_SCHEMA,
+    DELETE_TUNNEL_TOOL_SCHEMA,
+    FOLLOW_TUNNELS_TOOL_SCHEMA,
+    ADD_DRAWER_TOOL_SCHEMA,
+    DELETE_DRAWER_TOOL_SCHEMA,
+    GET_DRAWER_TOOL_SCHEMA,
+    LIST_DRAWERS_TOOL_SCHEMA,
+    UPDATE_DRAWER_TOOL_SCHEMA,
+    DIARY_WRITE_TOOL_SCHEMA,
+    DIARY_READ_TOOL_SCHEMA,
+    CHECK_DUPLICATE_TOOL_SCHEMA,
+    CHECK_FACTS_TOOL_SCHEMA,
+    HOOK_SETTINGS_TOOL_SCHEMA,
+    RECONNECT_TOOL_SCHEMA,
+    GET_AAAK_SPEC_TOOL_SCHEMA,
+    MEMORIES_FILED_AWAY_TOOL_SCHEMA,
+]
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class ResolvedPaths:
@@ -190,6 +602,12 @@ class SessionState:
     prefetch_future: Optional[Future[str]] = None
     pending_write_futures: List[Future[Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    memories_filed: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _slug(value: str) -> str:
@@ -308,6 +726,33 @@ def _strip_injected_memory(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _safe_content(value: str, max_length: int = 100_000) -> str:
+    """Sanitize content using mempalace's sanitize_content or fallback truncation."""
+    if sanitize_content is not None:
+        try:
+            return sanitize_content(value, max_length=max_length)
+        except (ValueError, TypeError):
+            pass
+    # Fallback: simple truncation
+    if len(value) > max_length:
+        return value[:max_length]
+    return value
+
+
+def _bounded_int(raw: Any, default: int, lo: int, hi: int) -> int:
+    """Parse an integer with bounds clamping."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(value, hi))
+
+
+# ---------------------------------------------------------------------------
+# Provider
+# ---------------------------------------------------------------------------
+
+
 class MemPalaceMemoryProvider(MemoryProvider):
     """Hermes memory provider backed by local MemPalace storage."""
 
@@ -325,6 +770,41 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self._chroma_client: Any = None
         self._chroma_lock = threading.Lock()
         self._cached_config: Optional[Dict[str, Any]] = None
+
+        # Build dispatch table
+        self._tool_dispatch: Dict[str, Any] = {
+            "mempalace_search": self._tool_search,
+            "mempalace_kg_query": self._tool_kg_query,
+            "mempalace_remember": self._tool_remember,
+            "mempalace_kg_add": self._tool_kg_add,
+            "mempalace_kg_invalidate": self._tool_kg_invalidate,
+            "mempalace_kg_timeline": self._tool_kg_timeline,
+            "mempalace_kg_stats": self._tool_kg_stats,
+            "mempalace_status": self._tool_status,
+            "mempalace_list_wings": self._tool_list_wings,
+            "mempalace_list_rooms": self._tool_list_rooms,
+            "mempalace_get_taxonomy": self._tool_get_taxonomy,
+            "mempalace_traverse": self._tool_traverse,
+            "mempalace_find_tunnels": self._tool_find_tunnels,
+            "mempalace_graph_stats": self._tool_graph_stats,
+            "mempalace_create_tunnel": self._tool_create_tunnel,
+            "mempalace_list_tunnels": self._tool_list_tunnels,
+            "mempalace_delete_tunnel": self._tool_delete_tunnel,
+            "mempalace_follow_tunnels": self._tool_follow_tunnels,
+            "mempalace_add_drawer": self._tool_add_drawer,
+            "mempalace_delete_drawer": self._tool_delete_drawer,
+            "mempalace_get_drawer": self._tool_get_drawer,
+            "mempalace_list_drawers": self._tool_list_drawers,
+            "mempalace_update_drawer": self._tool_update_drawer,
+            "mempalace_diary_write": self._tool_diary_write,
+            "mempalace_diary_read": self._tool_diary_read,
+            "mempalace_check_duplicate": self._tool_check_duplicate,
+            "mempalace_check_facts": self._tool_check_facts,
+            "mempalace_hook_settings": self._tool_hook_settings,
+            "mempalace_reconnect": self._tool_reconnect,
+            "mempalace_get_aaak_spec": self._tool_get_aaak_spec,
+            "mempalace_memories_filed_away": self._tool_memories_filed_away,
+        }
 
     @property
     def name(self) -> str:
@@ -424,13 +904,14 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return ""
         state = self._get_session_state()
         wing = state.wing if state else "wing_default"
+        tools_line = ", ".join(ALL_TOOL_NAMES)
         return "\n".join(
             [
                 "## MemPalace Memory",
                 f"- active wing: `{wing}`",
                 f"- palace path: `{_truncate(str(self._paths.palace_path), MAX_SYSTEM_PROMPT_PATH_CHARS)}`",
                 f"- kg path: `{_truncate(str(self._paths.kg_path), MAX_SYSTEM_PROMPT_PATH_CHARS)}`",
-                "- tools: mempalace_search, mempalace_kg_query, mempalace_remember",
+                f"- tools: {tools_line}",
                 "- use mempalace_remember only for durable facts worth preserving across sessions",
             ]
         )
@@ -545,73 +1026,529 @@ class MemPalaceMemoryProvider(MemoryProvider):
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
+        """Save the last few turns as drawers before context compression discards them."""
+        state = self._get_session_state()
+        if state is None or not state.allow_writes:
+            return
+
+        # Extract the last few user/assistant pairs
+        pairs: List[tuple] = []
+        i = len(messages) - 1
+        while i >= 0 and len(pairs) < 3:
+            msg = messages[i]
+            if msg.get("role") == "assistant":
+                assistant_text = msg.get("content", "")
+                # Look for the preceding user message
+                if i > 0 and messages[i - 1].get("role") == "user":
+                    user_text = messages[i - 1].get("content", "")
+                    if not _is_trivial_turn(user_text, assistant_text):
+                        pairs.append((user_text, assistant_text))
+                    i -= 2
+                    continue
+            i -= 1
+
+        for user_text, assistant_text in reversed(pairs):
+            room = "compressed"
+            cleaned_user = _strip_injected_memory(user_text)
+            cleaned_assistant = _strip_injected_memory(assistant_text)
+            document = (
+                "[role: user]\n"
+                f"{cleaned_user}\n\n"
+                "[role: assistant]\n"
+                f"{cleaned_assistant}"
+            ).strip()
+            drawer_id = self._content_drawer_id(state.wing, room, document)
+            try:
+                self._upsert_drawer(drawer_id, document, room, state)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("on_pre_compress write failed: %s", exc)
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_TOOL_SCHEMA, KG_QUERY_TOOL_SCHEMA, REMEMBER_TOOL_SCHEMA]
+        return list(_ALL_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         state = self._get_session_state(kwargs.get("session_id", ""))
         if state is None:
             return self._json_result({"error": "provider_not_initialized"})
 
-        if tool_name == "mempalace_search":
-            limit = self._bounded_limit(args.get("limit"), default=5)
-            room = _safe_room_name(args.get("room"), "general") if args.get("room") else None
-            # Search across all wings for broader recall; wing info is
-            # returned per-result so the caller can still distinguish origin.
-            result = search_memories(
-                str(args.get("query", "")),
-                palace_path=str(self._paths.palace_path),
-                wing=None,
-                room=room,
-                n_results=limit,
-            )
-            return self._json_result(result)
+        handler = self._tool_dispatch.get(tool_name)
+        if handler is None:
+            return self._json_result({"error": f"unknown_tool:{tool_name}"})
 
-        if tool_name == "mempalace_kg_query":
-            direction = str(args.get("direction") or "outgoing")
-            if direction not in {"outgoing", "incoming", "both"}:
-                direction = "outgoing"
-            kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
-            try:
-                result = {
-                    "entity": str(args.get("entity", "")),
-                    "direction": direction,
-                    "as_of": args.get("as_of"),
-                    "results": kg.query_entity(
-                        str(args.get("entity", "")),
-                        as_of=args.get("as_of"),
-                        direction=direction,
-                    ),
-                }
-            finally:
-                kg.close()
-            return self._json_result(result)
-
-        if tool_name == "mempalace_remember":
-            if not state.allow_writes:
-                return self._json_result({"success": False, "reason": "writes_disabled"})
-            content = str(args.get("content", "")).strip()
-            if not content:
-                return self._json_result({"success": False, "error": "content is required"})
-            room = _safe_room_name(args.get("room"), "facts")
-            drawer_id = self._content_drawer_id(state.wing, room, content)
-            self._upsert_drawer(drawer_id, content, room, state)
-            return self._json_result(
-                {
-                    "success": True,
-                    "drawer_id": drawer_id,
-                    "wing": state.wing,
-                    "room": room,
-                }
-            )
-
-        return self._json_result({"error": f"unknown_tool:{tool_name}"})
+        try:
+            return handler(state, args)
+        except Exception as exc:
+            logger.warning("Tool %s failed: %s", tool_name, exc, exc_info=True)
+            return self._json_result({"error": str(exc), "tool": tool_name})
 
     def shutdown(self) -> None:
         for session_id in list(self._sessions):
             self._flush_session(session_id)
         self._executor.shutdown(wait=True, cancel_futures=False)
         self._chroma_client = None
+
+    # ------------------------------------------------------------------
+    # Tool handlers
+    # ------------------------------------------------------------------
+
+    def _tool_search(self, state: SessionState, args: Dict) -> str:
+        limit = _bounded_int(args.get("limit"), default=5, lo=1, hi=10)
+        room = _safe_room_name(args.get("room"), "general") if args.get("room") else None
+        # Search across all wings for broader recall; wing info is
+        # returned per-result so the caller can still distinguish origin.
+        result = search_memories(
+            str(args.get("query", "")),
+            palace_path=str(self._paths.palace_path),
+            wing=None,
+            room=room,
+            n_results=limit,
+        )
+        return self._json_result(result)
+
+    def _tool_kg_query(self, state: SessionState, args: Dict) -> str:
+        direction = str(args.get("direction") or "outgoing")
+        if direction not in {"outgoing", "incoming", "both"}:
+            direction = "outgoing"
+        kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+        try:
+            result = {
+                "entity": str(args.get("entity", "")),
+                "direction": direction,
+                "as_of": args.get("as_of"),
+                "results": kg.query_entity(
+                    str(args.get("entity", "")),
+                    as_of=args.get("as_of"),
+                    direction=direction,
+                ),
+            }
+        finally:
+            kg.close()
+        return self._json_result(result)
+
+    def _tool_remember(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        content = _safe_content(str(args.get("content", "")).strip())
+        if not content:
+            return self._json_result({"success": False, "error": "content is required"})
+        room = _safe_room_name(args.get("room"), "facts")
+        drawer_id = self._content_drawer_id(state.wing, room, content)
+        self._upsert_drawer(drawer_id, content, room, state)
+        with state.lock:
+            state.memories_filed += 1
+        return self._json_result(
+            {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": state.wing,
+                "room": room,
+            }
+        )
+
+    def _tool_kg_add(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        subject = str(args.get("subject", "")).strip()
+        predicate = str(args.get("predicate", "")).strip()
+        obj = str(args.get("object", "")).strip()
+        if not all([subject, predicate, obj]):
+            return self._json_result({"success": False, "error": "subject, predicate, object required"})
+        kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+        try:
+            kg.add_triple(subject, predicate, obj, valid_from=args.get("valid_from"))
+        finally:
+            kg.close()
+        return self._json_result({"success": True, "subject": subject, "predicate": predicate, "object": obj})
+
+    def _tool_kg_invalidate(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        subject = str(args.get("subject", "")).strip()
+        predicate = str(args.get("predicate", "")).strip()
+        obj = str(args.get("object", "")).strip()
+        if not all([subject, predicate, obj]):
+            return self._json_result({"success": False, "error": "subject, predicate, object required"})
+        kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+        try:
+            kg.invalidate(subject, predicate, obj, ended=args.get("ended"))
+        finally:
+            kg.close()
+        return self._json_result({"success": True, "subject": subject, "predicate": predicate, "object": obj})
+
+    def _tool_kg_timeline(self, state: SessionState, args: Dict) -> str:
+        entity = args.get("entity")
+        entity = str(entity).strip() if entity else None
+        kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+        try:
+            result = kg.timeline(entity_name=entity)
+        finally:
+            kg.close()
+        return self._json_result({"timeline": result})
+
+    def _tool_kg_stats(self, state: SessionState, args: Dict) -> str:
+        kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+        try:
+            result = kg.stats()
+        finally:
+            kg.close()
+        return self._json_result({"stats": result})
+
+    def _tool_status(self, state: SessionState, args: Dict) -> str:
+        collection = self._get_collection(create=False)
+        count = collection.count() if collection else 0
+        return self._json_result({
+            "provider": "mempalace",
+            "version": "2.0.0",
+            "wing": state.wing,
+            "palace_path": str(self._paths.palace_path),
+            "kg_path": str(self._paths.kg_path),
+            "drawer_count": count,
+            "session_id": state.session_id,
+        })
+
+    def _tool_list_wings(self, state: SessionState, args: Dict) -> str:
+        wings = self._scan_metadata_field("wing")
+        return self._json_result({"wings": sorted(wings.keys()), "counts": wings})
+
+    def _tool_list_rooms(self, state: SessionState, args: Dict) -> str:
+        wing_filter = args.get("wing")
+        rooms = self._scan_metadata_field("room", wing_filter=wing_filter)
+        return self._json_result({"rooms": sorted(rooms.keys()), "counts": rooms})
+
+    def _tool_get_taxonomy(self, state: SessionState, args: Dict) -> str:
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"taxonomy": {}})
+
+        taxonomy: Dict[str, Dict[str, int]] = {}
+        total = collection.count()
+        offset = 0
+        batch_size = 1000
+        while offset < total:
+            batch = collection.get(
+                offset=offset,
+                limit=batch_size,
+                include=["metadatas"],
+            )
+            for meta in (batch.get("metadatas") or []):
+                wing = (meta or {}).get("wing", "unknown")
+                room = (meta or {}).get("room", "unknown")
+                if wing not in taxonomy:
+                    taxonomy[wing] = {}
+                taxonomy[wing][room] = taxonomy[wing].get(room, 0) + 1
+            offset += batch_size
+
+        return self._json_result({"taxonomy": taxonomy})
+
+    def _tool_traverse(self, state: SessionState, args: Dict) -> str:
+        if traverse is None:
+            return self._json_result({"error": "traverse not available"})
+        start_room = str(args.get("start_room", ""))
+        max_hops = _bounded_int(args.get("max_hops"), default=2, lo=1, hi=10)
+        col = self._get_collection(create=False)
+        result = traverse(start_room, col=col, config=None, max_hops=max_hops)
+        return self._json_result({"traversal": result})
+
+    def _tool_find_tunnels(self, state: SessionState, args: Dict) -> str:
+        if find_tunnels is None:
+            return self._json_result({"error": "find_tunnels not available"})
+        col = self._get_collection(create=False)
+        result = find_tunnels(
+            wing_a=args.get("wing_a"),
+            wing_b=args.get("wing_b"),
+            col=col,
+            config=None,
+        )
+        return self._json_result({"tunnels": result})
+
+    def _tool_graph_stats(self, state: SessionState, args: Dict) -> str:
+        if graph_stats is None:
+            return self._json_result({"error": "graph_stats not available"})
+        col = self._get_collection(create=False)
+        result = graph_stats(col=col, config=None)
+        return self._json_result({"stats": result})
+
+    def _tool_create_tunnel(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        if create_tunnel is None:
+            return self._json_result({"error": "create_tunnel not available"})
+        result = create_tunnel(
+            source_wing=str(args.get("source_wing", "")),
+            source_room=str(args.get("source_room", "")),
+            target_wing=str(args.get("target_wing", "")),
+            target_room=str(args.get("target_room", "")),
+            label=str(args.get("label", "")),
+            source_drawer_id=args.get("source_drawer_id"),
+            target_drawer_id=args.get("target_drawer_id"),
+        )
+        return self._json_result({"success": True, "tunnel": result})
+
+    def _tool_list_tunnels(self, state: SessionState, args: Dict) -> str:
+        if list_tunnels is None:
+            return self._json_result({"error": "list_tunnels not available"})
+        result = list_tunnels(wing=args.get("wing"))
+        return self._json_result({"tunnels": result})
+
+    def _tool_delete_tunnel(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        if delete_tunnel is None:
+            return self._json_result({"error": "delete_tunnel not available"})
+        result = delete_tunnel(tunnel_id=str(args.get("tunnel_id", "")))
+        return self._json_result({"success": True, "result": result})
+
+    def _tool_follow_tunnels(self, state: SessionState, args: Dict) -> str:
+        if follow_tunnels is None:
+            return self._json_result({"error": "follow_tunnels not available"})
+        col = self._get_collection(create=False)
+        result = follow_tunnels(
+            wing=str(args.get("wing", "")),
+            room=str(args.get("room", "")),
+            col=col,
+            config=None,
+        )
+        return self._json_result({"tunnels": result})
+
+    def _tool_add_drawer(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        content = _safe_content(str(args.get("content", "")).strip())
+        if not content:
+            return self._json_result({"success": False, "error": "content is required"})
+        room = _safe_room_name(args.get("room"), "general")
+        wing_override = args.get("wing")
+        drawer_id = args.get("drawer_id")
+        if not drawer_id:
+            drawer_id = self._content_drawer_id(
+                wing_override or state.wing, room, content
+            )
+        self._upsert_drawer(
+            drawer_id, content, room, state, wing_override=wing_override
+        )
+        with state.lock:
+            state.memories_filed += 1
+        return self._json_result({
+            "success": True,
+            "drawer_id": drawer_id,
+            "wing": wing_override or state.wing,
+            "room": room,
+        })
+
+    def _tool_delete_drawer(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        drawer_id = str(args.get("drawer_id", "")).strip()
+        if not drawer_id:
+            return self._json_result({"success": False, "error": "drawer_id is required"})
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"success": False, "error": "collection not found"})
+        collection.delete(ids=[drawer_id])
+        return self._json_result({"success": True, "deleted": drawer_id})
+
+    def _tool_get_drawer(self, state: SessionState, args: Dict) -> str:
+        drawer_id = str(args.get("drawer_id", "")).strip()
+        if not drawer_id:
+            return self._json_result({"error": "drawer_id is required"})
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"error": "collection not found"})
+        result = collection.get(ids=[drawer_id], include=["documents", "metadatas"])
+        if not result["ids"]:
+            return self._json_result({"error": "drawer not found", "drawer_id": drawer_id})
+        return self._json_result({
+            "drawer_id": result["ids"][0],
+            "content": result["documents"][0],
+            "metadata": result["metadatas"][0],
+        })
+
+    def _tool_list_drawers(self, state: SessionState, args: Dict) -> str:
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"drawers": []})
+        limit = _bounded_int(args.get("limit"), default=20, lo=1, hi=100)
+        wing_filter = args.get("wing")
+        room_filter = args.get("room")
+
+        where: Optional[Dict] = None
+        if wing_filter and room_filter:
+            where = {"$and": [{"wing": wing_filter}, {"room": room_filter}]}
+        elif wing_filter:
+            where = {"wing": wing_filter}
+        elif room_filter:
+            where = {"room": room_filter}
+
+        kwargs: Dict[str, Any] = {"limit": limit, "include": ["documents", "metadatas"]}
+        if where:
+            kwargs["where"] = where
+
+        result = collection.get(**kwargs)
+        drawers = []
+        for i, did in enumerate(result.get("ids", [])):
+            drawers.append({
+                "drawer_id": did,
+                "content": (result.get("documents") or [])[i] if i < len(result.get("documents") or []) else "",
+                "metadata": (result.get("metadatas") or [])[i] if i < len(result.get("metadatas") or []) else {},
+            })
+        return self._json_result({"drawers": drawers})
+
+    def _tool_update_drawer(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        drawer_id = str(args.get("drawer_id", "")).strip()
+        content = _safe_content(str(args.get("content", "")).strip())
+        if not drawer_id:
+            return self._json_result({"success": False, "error": "drawer_id is required"})
+        if not content:
+            return self._json_result({"success": False, "error": "content is required"})
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"success": False, "error": "collection not found"})
+        # Get existing metadata to preserve it
+        existing = collection.get(ids=[drawer_id], include=["metadatas"])
+        if not existing["ids"]:
+            return self._json_result({"success": False, "error": "drawer not found"})
+        metadata = existing["metadatas"][0]
+        metadata["filed_at"] = datetime.now().isoformat()
+        collection.update(ids=[drawer_id], documents=[content], metadatas=[metadata])
+        return self._json_result({"success": True, "drawer_id": drawer_id})
+
+    def _tool_diary_write(self, state: SessionState, args: Dict) -> str:
+        if not state.allow_writes:
+            return self._json_result({"success": False, "reason": "writes_disabled"})
+        entry = _safe_content(str(args.get("entry", "")).strip())
+        if not entry:
+            return self._json_result({"success": False, "error": "entry is required"})
+
+        agent_name = state.agent_identity or "default"
+        room = f"diary_{_slug(agent_name)}"
+        today = datetime.now().strftime("%Y-%m-%d")
+        drawer_id = f"diary_{_slug(agent_name)}_{today}"
+
+        # Check if same-day entry exists; if so, append
+        collection = self._get_collection(create=True)
+        existing = collection.get(ids=[drawer_id], include=["documents", "metadatas"])
+        if existing["ids"]:
+            old_content = existing["documents"][0] or ""
+            new_content = f"{old_content}\n\n---\n\n{entry}"
+            metadata = existing["metadatas"][0]
+            metadata["filed_at"] = datetime.now().isoformat()
+            collection.update(ids=[drawer_id], documents=[new_content], metadatas=[metadata])
+        else:
+            self._upsert_drawer(drawer_id, entry, room, state)
+
+        with state.lock:
+            state.memories_filed += 1
+        return self._json_result({
+            "success": True,
+            "drawer_id": drawer_id,
+            "room": room,
+            "date": today,
+        })
+
+    def _tool_diary_read(self, state: SessionState, args: Dict) -> str:
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return self._json_result({"entries": []})
+
+        agent_name = state.agent_identity or "default"
+        room = f"diary_{_slug(agent_name)}"
+        limit = _bounded_int(args.get("limit"), default=5, lo=1, hi=50)
+
+        result = collection.get(
+            where={"room": room},
+            include=["documents", "metadatas"],
+        )
+        entries = []
+        for i, did in enumerate(result.get("ids", [])):
+            entries.append({
+                "drawer_id": did,
+                "content": (result.get("documents") or [])[i] if i < len(result.get("documents") or []) else "",
+                "metadata": (result.get("metadatas") or [])[i] if i < len(result.get("metadatas") or []) else {},
+            })
+        # Sort by drawer_id descending (dates sort lexicographically)
+        entries.sort(key=lambda e: e["drawer_id"], reverse=True)
+        return self._json_result({"entries": entries[:limit]})
+
+    def _tool_check_duplicate(self, state: SessionState, args: Dict) -> str:
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return self._json_result({"error": "content is required"})
+        room = args.get("room")
+        room_name = _safe_room_name(room, "general") if room else None
+
+        # Check by content hash match
+        result = search_memories(
+            content,
+            palace_path=str(self._paths.palace_path),
+            wing=None,
+            room=room_name,
+            n_results=3,
+            max_distance=0.0,
+        )
+        hits = result.get("results", []) if isinstance(result, dict) else []
+        exact_matches = [h for h in hits if h.get("text", "").strip() == content]
+        return self._json_result({
+            "is_duplicate": len(exact_matches) > 0,
+            "matches": len(exact_matches),
+            "similar": len(hits),
+        })
+
+    def _tool_check_facts(self, state: SessionState, args: Dict) -> str:
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return self._json_result({"error": "text is required"})
+        if fact_check_text is None:
+            return self._json_result({"error": "fact_checker not available"})
+        issues = fact_check_text(text, palace_path=str(self._paths.palace_path), config=None)
+        return self._json_result({"issues": issues, "count": len(issues)})
+
+    def _tool_hook_settings(self, state: SessionState, args: Dict) -> str:
+        if MempalaceConfig is None:
+            return self._json_result({"error": "MempalaceConfig not available"})
+        config = MempalaceConfig()
+        key = args.get("key")
+        value = args.get("value")
+        if key is not None and value is not None:
+            if not state.allow_writes:
+                return self._json_result({"success": False, "reason": "writes_disabled"})
+            config.set_hook_setting(key, value)
+            return self._json_result({"success": True, "key": key, "value": value})
+        # List current settings
+        return self._json_result({
+            "hook_silent_save": config.hook_silent_save,
+            "hook_desktop_toast": config.hook_desktop_toast,
+        })
+
+    def _tool_reconnect(self, state: SessionState, args: Dict) -> str:
+        with self._chroma_lock:
+            self._chroma_client = None
+        # Re-create on next access
+        try:
+            col = self._get_collection(create=True)
+            count = col.count() if col else 0
+        except Exception as exc:
+            return self._json_result({"success": False, "error": str(exc)})
+        return self._json_result({"success": True, "drawer_count": count})
+
+    def _tool_get_aaak_spec(self, state: SessionState, args: Dict) -> str:
+        return self._json_result({
+            "spec": "AAAK/1.0",
+            "provider": "mempalace",
+            "version": "2.0.0",
+            "capabilities": ALL_TOOL_NAMES,
+        })
+
+    def _tool_memories_filed_away(self, state: SessionState, args: Dict) -> str:
+        with state.lock:
+            count = state.memories_filed
+        return self._json_result({"memories_filed": count, "session_id": state.session_id})
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _ensure_session_state(self, session_id: str, **kwargs) -> SessionState:
         if not session_id:
@@ -721,10 +1658,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         state: SessionState,
         *,
         turn_number: Optional[int] = None,
+        wing_override: Optional[str] = None,
     ) -> None:
         collection = self._get_collection(create=True)
+        wing = wing_override or state.wing
         metadata = {
-            "wing": state.wing,
+            "wing": wing,
             "room": room,
             "source_file": "",
             "chunk_index": 0,
@@ -741,7 +1680,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
     def _get_collection(self, *, create: bool):
         if chromadb is None or self._paths is None:
-            raise RuntimeError("MemPalace provider is unavailable")
+            if create:
+                raise RuntimeError("MemPalace provider is unavailable")
+            return None
         with self._chroma_lock:
             if self._chroma_client is None:
                 import os
@@ -751,7 +1692,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 )
         if create:
             return self._chroma_client.get_or_create_collection(COLLECTION_NAME)
-        return self._chroma_client.get_collection(COLLECTION_NAME)
+        try:
+            return self._chroma_client.get_collection(COLLECTION_NAME)
+        except Exception:
+            return None
 
     def _content_drawer_id(self, wing: str, room: str, content: str) -> str:
         digest = hashlib.sha256(f"{wing}:{room}:{content}".encode("utf-8")).hexdigest()[:24]
@@ -784,7 +1728,34 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 logger.warning("Write flush failed for %s: %s", session_id, exc)
 
     def _json_result(self, payload: Dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        return json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+
+    def _scan_metadata_field(self, field_name: str, *, wing_filter: Optional[str] = None) -> Dict[str, int]:
+        """Scan ChromaDB metadata in batches, counting distinct values of a field."""
+        collection = self._get_collection(create=False)
+        if collection is None:
+            return {}
+
+        counts: Dict[str, int] = {}
+        total = collection.count()
+        offset = 0
+        batch_size = 1000
+        while offset < total:
+            batch = collection.get(
+                offset=offset,
+                limit=batch_size,
+                include=["metadatas"],
+            )
+            for meta in (batch.get("metadatas") or []):
+                if meta is None:
+                    continue
+                if wing_filter and meta.get("wing") != wing_filter:
+                    continue
+                value = meta.get(field_name, "unknown")
+                counts[value] = counts.get(value, 0) + 1
+            offset += batch_size
+
+        return counts
 
 
 def register(ctx) -> None:
