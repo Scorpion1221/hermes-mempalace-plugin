@@ -72,16 +72,22 @@ FIRST_TURN_RECALL_LIMIT = 5
 PREFETCH_RECALL_LIMIT = 5
 MAX_RECALL_SNIPPET_CHARS = 400
 MAX_SYSTEM_PROMPT_PATH_CHARS = 120
-TRIVIAL_USER_MESSAGES = {
-    "ok",
-    "okay",
-    "thanks",
-    "thank you",
-    "cool",
-    "nice",
-    "great",
-    "sounds good",
-}
+TRIVIAL_USER_MESSAGES = frozenset({
+    # Greetings
+    "hi", "hello", "hey", "嗨", "你好",
+    # Acknowledgement
+    "ok", "okay", "好", "好的", "行", "嗯", "对",
+    "cool", "nice", "great", "sounds good",
+    # Affirmation / negation
+    "yes", "no", "是", "是的", "不", "不是",
+    # Continuation
+    "continue", "go", "go on", "next", "继续",
+    # Gratitude
+    "thanks", "thank you", "thx", "谢谢",
+    # Completion / exit
+    "done", "完成", "搞定", "stop", "quit", "exit",
+})
+MIN_RECALL_QUERY_LEN = 6  # skip very short prompts from recall
 
 ALL_TOOL_NAMES = [
     "mempalace_search",
@@ -965,6 +971,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         state = self._get_session_state(session_id)
         if state is None or not query.strip():
+            return
+
+        # Skip recall for trivial prompts
+        normalized = _normalize_user_message(query)
+        if len(normalized) < MIN_RECALL_QUERY_LEN or normalized in TRIVIAL_USER_MESSAGES:
             return
 
         state.last_user_query = query
