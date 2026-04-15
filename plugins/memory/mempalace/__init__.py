@@ -68,9 +68,9 @@ COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BASE_DIR_NAME = "mempalace"
 CONFIG_FILE_NAME = "mempalace.json"
 WRITE_BLOCKED_CONTEXTS = {"subagent", "cron", "flush"}
-FIRST_TURN_RECALL_LIMIT = 3
+FIRST_TURN_RECALL_LIMIT = 5
 PREFETCH_RECALL_LIMIT = 5
-MAX_RECALL_SNIPPET_CHARS = 240
+MAX_RECALL_SNIPPET_CHARS = 400
 MAX_SYSTEM_PROMPT_PATH_CHARS = 120
 TRIVIAL_USER_MESSAGES = {
     "ok",
@@ -954,10 +954,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if cached:
             return cached
 
-        if state.turn_number <= 0:
-            return self._render_recall(query or state.last_user_query, state, FIRST_TURN_RECALL_LIMIT)
-
-        return ""
+        # Always fall back to synchronous recall when no prefetch cache is
+        # available.  Previously this was gated on turn_number <= 0 which
+        # meant later turns with no cache silently returned "".  The query
+        # passed here is the *current* user message (or the enriched
+        # persist_user_message that includes reply-to context), so recall
+        # is always relevant to what the user just said.
+        return self._render_recall(query or state.last_user_query, state, FIRST_TURN_RECALL_LIMIT)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         state = self._get_session_state(session_id)
@@ -1525,6 +1528,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
     def _tool_reconnect(self, state: SessionState, args: Dict) -> str:
         with self._chroma_lock:
             self._chroma_client = None
+            # Clear ChromaDB's global singleton registry so PersistentClient
+            # can be re-created with fresh settings (avoids "different settings" error).
+            try:
+                from chromadb.api.shared_system_client import SharedSystemClient
+                SharedSystemClient.clear_system_cache()
+            except Exception:
+                pass
         # Re-create on next access
         try:
             col = self._get_collection(create=True)
@@ -1617,12 +1627,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
             query=query,
             palace_path=str(self._paths.palace_path),
             wing=None,  # search all wings for broader recall
+            preferred_wing=state.wing,  # soft-boost results from the active wing
             n_results=limit,
         )
         hits = result.get("results", []) if isinstance(result, dict) else []
         if not hits:
             return ""
-
         lines = ["## MemPalace Recall"]
         for hit in hits[:limit]:
             room = hit.get("room", "general")
@@ -1687,9 +1697,20 @@ class MemPalaceMemoryProvider(MemoryProvider):
             if self._chroma_client is None:
                 import os
                 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-                self._chroma_client = chromadb.PersistentClient(
-                    path=str(self._paths.palace_path),
-                )
+                try:
+                    self._chroma_client = chromadb.PersistentClient(
+                        path=str(self._paths.palace_path),
+                    )
+                except ValueError:
+                    # ChromaDB singleton conflict — clear global cache and retry.
+                    try:
+                        from chromadb.api.shared_system_client import SharedSystemClient
+                        SharedSystemClient.clear_system_cache()
+                    except Exception:
+                        pass
+                    self._chroma_client = chromadb.PersistentClient(
+                        path=str(self._paths.palace_path),
+                    )
         if create:
             return self._chroma_client.get_or_create_collection(COLLECTION_NAME)
         try:
