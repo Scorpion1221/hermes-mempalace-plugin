@@ -1021,13 +1021,130 @@ class MemPalaceMemoryProvider(MemoryProvider):
             state.pending_write_futures.append(future)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        del messages  # The V1 provider only flushes queued writes.
         session_id = self._current_session_id or self._default_session_id
         if not session_id:
             return
+
+        # --- Auto-diary: summarise the session into AAAK-style entry ---
+        state = self._sessions.get(session_id)
+        if state and state.allow_writes and messages and len(messages) > 2:
+            try:
+                self._auto_diary(state, messages)
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.debug("auto-diary failed: %s", exc)
+
         self._flush_session(session_id)
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
+
+    # ------------------------------------------------------------------
+    # Auto-diary: write a compact session summary on session end
+    # ------------------------------------------------------------------
+
+    def _auto_diary(self, state: "SessionState", messages: List[Dict[str, Any]]) -> None:
+        """Write a compact AAAK-style diary entry summarising the session.
+
+        Extracts: tool calls used, user topics, turn count, platform.
+        No LLM needed — pure extraction from message history.
+        Mirrors the Claude Code Stop-hook pattern but runs server-side.
+        """
+        agent_name = state.agent_identity or "hermes"
+        today = datetime.now().strftime("%Y-%m-%d")
+        now_ts = datetime.now().strftime("%H%M")
+
+        # Count turns and collect tool names
+        user_turns = 0
+        tool_names: list = []
+        first_user_msg = ""
+        last_user_msg = ""
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "user":
+                user_turns += 1
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    text = content.strip()
+                elif isinstance(content, list):
+                    text = " ".join(
+                        b.get("text", "") for b in content if isinstance(b, dict)
+                    ).strip()
+                else:
+                    text = ""
+                # Skip injected memory/system preamble
+                if text and not text.startswith("## MemPalace") and len(text) > 5:
+                    if not first_user_msg:
+                        first_user_msg = text[:120]
+                    last_user_msg = text[:120]
+            elif role == "assistant":
+                # Collect tool calls
+                tc = msg.get("tool_calls") or []
+                for call in tc:
+                    fn = call.get("function", {}).get("name", "")
+                    if fn and fn not in tool_names:
+                        tool_names.append(fn)
+
+        # Skip trivial sessions (< 3 user turns)
+        if user_turns < 3:
+            return
+
+        # Build AAAK-style entry
+        # Truncate topic from first user message
+        topic_slug = (
+            first_user_msg[:60]
+            .replace("\n", " ")
+            .replace("|", "/")
+            .strip()
+        )
+        last_slug = (
+            last_user_msg[:60]
+            .replace("\n", " ")
+            .replace("|", "/")
+            .strip()
+        )
+
+        parts = [f"SESSION:{today}T{now_ts}"]
+        if state.platform:
+            parts.append(f"via:{state.platform}")
+        parts.append(f"turns:{user_turns}")
+        if topic_slug:
+            parts.append(f"topic:{topic_slug}")
+        if last_slug and last_slug != topic_slug:
+            parts.append(f"last:{last_slug}")
+        if tool_names:
+            # Keep up to 8 unique tool names, abbreviated
+            abbrev = [t.replace("mempalace_", "mp:") for t in tool_names[:8]]
+            parts.append(f"tools:{'+'.join(abbrev)}")
+        if len(tool_names) > 8:
+            parts.append(f"+{len(tool_names) - 8}more")
+
+        entry = "|".join(parts)
+
+        # Use the same diary mechanism as _tool_diary_write
+        room = "diary"
+        drawer_id = f"diary_{_slug(agent_name)}_{today}_{now_ts}"
+
+        collection = self._get_collection(create=True)
+        if collection is None:
+            return
+
+        meta = {
+            "wing": state.wing,
+            "room": room,
+            "type": "diary_entry",
+            "agent": agent_name,
+            "date": today,
+            "filed_at": datetime.now().isoformat(),
+        }
+        try:
+            collection.upsert(
+                ids=[drawer_id],
+                documents=[entry],
+                metadatas=[meta],
+            )
+            state.filed_count += 1
+            logger.info("auto-diary: %s → %s", drawer_id, entry[:120])
+        except Exception as exc:  # pragma: no cover
+            logger.warning("auto-diary upsert failed: %s", exc)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
         """Save the last few turns as drawers before context compression discards them."""
