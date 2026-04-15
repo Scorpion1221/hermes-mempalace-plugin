@@ -1052,10 +1052,64 @@ class MemPalaceMemoryProvider(MemoryProvider):
     # Auto-diary: write a compact session summary on session end
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_msg_text(msg: dict) -> str:
+        """Extract plain text from a message, handling str and list content."""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            ).strip()
+        return ""
+
+    @staticmethod
+    def _is_user_content(text: str) -> bool:
+        """Check if text is meaningful user content (not injected memory/preamble)."""
+        return bool(
+            text
+            and not text.startswith("## MemPalace")
+            and not text.startswith("<<MEMORY_CONTEXT>>")
+            and not text.startswith("<mempalace-recall>")
+            and len(text) > 5
+        )
+
+    @staticmethod
+    def _extract_keywords(texts: list, max_keywords: int = 10) -> list:
+        """Extract salient keywords from user messages for searchability.
+
+        Looks for file paths, technical terms, CJK phrases, and action verbs.
+        """
+        import re as _re
+
+        keywords = []
+        seen = set()
+        for text in texts:
+            # File paths (e.g. src/foo/bar.py, ~/.hermes/config.json)
+            for m in _re.finditer(r'[~/.]?[\w._-]+/[\w._/-]+', text):
+                token = m.group().rstrip("/")
+                if token not in seen and len(token) > 4:
+                    keywords.append(token)
+                    seen.add(token)
+            # Backtick-quoted identifiers (e.g. `feishu.py`, `hook_stop`)
+            for m in _re.finditer(r'`([^`]{2,60})`', text):
+                token = m.group(1)
+                if token not in seen:
+                    keywords.append(token)
+                    seen.add(token)
+            # CJK key phrases (2-8 chars surrounded by punctuation/space)
+            for m in _re.finditer(r'[\u4e00-\u9fff]{2,8}', text):
+                token = m.group()
+                if token not in seen:
+                    keywords.append(token)
+                    seen.add(token)
+        return keywords[:max_keywords]
+
     def _auto_diary(self, state: "SessionState", messages: List[Dict[str, Any]]) -> None:
         """Write a compact AAAK-style diary entry summarising the session.
 
-        Extracts: tool calls used, user topics, turn count, platform.
+        Extracts: tool calls, user topics, keywords, decisions, turn count.
         No LLM needed — pure extraction from message history.
         Mirrors the Claude Code Stop-hook pattern but runs server-side.
         """
@@ -1063,30 +1117,28 @@ class MemPalaceMemoryProvider(MemoryProvider):
         today = datetime.now().strftime("%Y-%m-%d")
         now_ts = datetime.now().strftime("%H%M")
 
-        # Count turns and collect tool names
+        # Pass 1: collect structured data from all messages
         user_turns = 0
         tool_names: list = []
+        user_texts: list = []
+        assistant_texts: list = []
         first_user_msg = ""
         last_user_msg = ""
+
         for msg in messages:
             role = msg.get("role", "")
             if role == "user":
                 user_turns += 1
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    text = content.strip()
-                elif isinstance(content, list):
-                    text = " ".join(
-                        b.get("text", "") for b in content if isinstance(b, dict)
-                    ).strip()
-                else:
-                    text = ""
-                # Skip injected memory/system preamble
-                if text and not text.startswith("## MemPalace") and len(text) > 5:
+                text = self._extract_msg_text(msg)
+                if self._is_user_content(text):
+                    user_texts.append(text)
                     if not first_user_msg:
                         first_user_msg = text[:120]
                     last_user_msg = text[:120]
             elif role == "assistant":
+                text = self._extract_msg_text(msg)
+                if text and len(text) > 20:
+                    assistant_texts.append(text)
                 # Collect tool calls
                 tc = msg.get("tool_calls") or []
                 for call in tc:
@@ -1098,16 +1150,34 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if user_turns < 3:
             return
 
+        # Pass 2: extract searchable keywords from user messages
+        keywords = self._extract_keywords(user_texts)
+
+        # Pass 3: extract key actions/decisions from assistant messages
+        actions: list = []
+        import re as _re
+        action_patterns = [
+            _re.compile(r'(?:已|完成|修复|修好|创建|添加|删除|更新|部署|重启|提交|推送)了?\s*[`\u4e00-\u9fff\w._/-]{2,40}'),
+            _re.compile(r'(?:✅|✓|☑)\s*.{5,60}'),
+        ]
+        for text in assistant_texts[-6:]:  # focus on recent assistant turns
+            for pat in action_patterns:
+                for m in pat.finditer(text):
+                    action = m.group().strip()
+                    if action not in actions:
+                        actions.append(action)
+                        if len(actions) >= 5:
+                            break
+
         # Build AAAK-style entry
-        # Truncate topic from first user message
         topic_slug = (
-            first_user_msg[:60]
+            first_user_msg[:80]
             .replace("\n", " ")
             .replace("|", "/")
             .strip()
         )
         last_slug = (
-            last_user_msg[:60]
+            last_user_msg[:80]
             .replace("\n", " ")
             .replace("|", "/")
             .strip()
@@ -1118,9 +1188,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
             parts.append(f"via:{state.platform}")
         parts.append(f"turns:{user_turns}")
         if topic_slug:
-            parts.append(f"topic:{topic_slug}")
+            parts.append(f"USR.ask:{topic_slug}")
         if last_slug and last_slug != topic_slug:
-            parts.append(f"last:{last_slug}")
+            parts.append(f"USR.last:{last_slug}")
+        if actions:
+            parts.append(f"ACT:{'; '.join(actions[:5])}")
+        if keywords:
+            parts.append(f"KW:{','.join(keywords[:10])}")
         if tool_names:
             # Keep up to 8 unique tool names, abbreviated
             abbrev = [t.replace("mempalace_", "mp:") for t in tool_names[:8]]
