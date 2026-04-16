@@ -70,6 +70,7 @@ CONFIG_FILE_NAME = "mempalace.json"
 WRITE_BLOCKED_CONTEXTS = {"subagent", "cron", "flush"}
 FIRST_TURN_RECALL_LIMIT = 5
 PREFETCH_RECALL_LIMIT = 5
+RECALL_POOL = 10  # over-fetch for LLM reranking
 MAX_RECALL_SNIPPET_CHARS = 400
 MAX_SYSTEM_PROMPT_PATH_CHARS = 120
 TRIVIAL_USER_MESSAGES = frozenset({
@@ -1825,16 +1826,46 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not query.strip() or self._paths is None:
             return ""
 
+        # --- LLM-enhanced recall (opt-in via MEMPAL_RECALL_LLM=1) ---
+        llm_config = None
+        search_query = query
+        try:
+            from mempalace.recall_llm import is_enabled, _get_llm_config, rewrite_query, rerank
+            if is_enabled():
+                llm_config = _get_llm_config()
+            if llm_config:
+                rewritten = rewrite_query(query, config=llm_config)
+                if rewritten:
+                    logger.debug("Recall: query rewritten to %r", rewritten[:80])
+                    search_query = rewritten
+        except Exception as e:
+            logger.debug("Recall: query rewrite failed (%s), using original", e)
+
+        pool_size = RECALL_POOL if llm_config else limit
         result = search_memories(
-            query=query,
+            query=search_query,
             palace_path=str(self._paths.palace_path),
             wing=None,  # search all wings for broader recall
             preferred_wing=state.wing,  # soft-boost results from the active wing
-            n_results=limit,
+            n_results=pool_size,
         )
         hits = result.get("results", []) if isinstance(result, dict) else []
         if not hits:
             return ""
+
+        # LLM rerank + relevance filter
+        if llm_config and len(hits) > limit:
+            try:
+                reranked = rerank(query, hits, top_k=limit, config=llm_config)
+                if reranked is not None:
+                    if len(reranked) == 0:
+                        logger.debug("Recall: LLM filtered all %d hits as irrelevant", len(hits))
+                        return ""
+                    logger.debug("Recall: LLM reranked %d → %d", len(hits), len(reranked))
+                    hits = reranked
+            except Exception as e:
+                logger.debug("Recall: LLM rerank failed (%s), using BM25 order", e)
+
         lines = ["## MemPalace Recall"]
         for hit in hits[:limit]:
             room = hit.get("room", "general")
