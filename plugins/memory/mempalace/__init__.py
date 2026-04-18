@@ -1076,7 +1076,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not session_id:
             return
 
-        # --- Auto-diary: summarise the session into AAAK-style entry ---
+        # --- Auto-diary: write a natural language session summary ---
         state = self._sessions.get(session_id)
         if state and state.allow_writes and messages and len(messages) > 2:
             try:
@@ -1148,11 +1148,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         return keywords[:max_keywords]
 
     def _auto_diary(self, state: "SessionState", messages: List[Dict[str, Any]]) -> None:
-        """Write a compact AAAK-style diary entry summarising the session.
+        """Write a natural language diary entry summarising the session.
 
         Extracts: tool calls, user topics, keywords, decisions, turn count.
         No LLM needed — pure extraction from message history.
         Mirrors the Claude Code Stop-hook pattern but runs server-side.
+        Output is plain natural language for better vector search recall.
         """
         agent_name = state.agent_identity or "hermes"
         today = datetime.now().strftime("%Y-%m-%d")
@@ -1210,7 +1211,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         if len(actions) >= 5:
                             break
 
-        # Build AAAK-style entry
+        # Build natural language entry
         topic_slug = (
             first_user_msg[:80]
             .replace("\n", " ")
@@ -1224,26 +1225,28 @@ class MemPalaceMemoryProvider(MemoryProvider):
             .strip()
         )
 
-        parts = [f"SESSION:{today}T{now_ts}"]
+        parts = [f"Session on {today} at {now_ts}"]
         if state.platform:
-            parts.append(f"via:{state.platform}")
-        parts.append(f"turns:{user_turns}")
-        if topic_slug:
-            parts.append(f"USR.ask:{topic_slug}")
-        if last_slug and last_slug != topic_slug:
-            parts.append(f"USR.last:{last_slug}")
-        if actions:
-            parts.append(f"ACT:{'; '.join(actions[:5])}")
-        if keywords:
-            parts.append(f"KW:{','.join(keywords[:10])}")
-        if tool_names:
-            # Keep up to 8 unique tool names, abbreviated
-            abbrev = [t.replace("mempalace_", "mp:") for t in tool_names[:8]]
-            parts.append(f"tools:{'+'.join(abbrev)}")
-        if len(tool_names) > 8:
-            parts.append(f"+{len(tool_names) - 8}more")
+            parts.append(f"via {state.platform}")
+        parts.append(f"({user_turns} turns)")
+        entry_header = " ".join(parts) + "."
 
-        entry = "|".join(parts)
+        body_parts = []
+        if topic_slug:
+            body_parts.append(f"User asked: {topic_slug}")
+        if last_slug and last_slug != topic_slug:
+            body_parts.append(f"Last topic: {last_slug}")
+        if actions:
+            body_parts.append(f"Actions taken: {'; '.join(actions[:5])}")
+        if keywords:
+            body_parts.append(f"Keywords: {', '.join(keywords[:10])}")
+        if tool_names:
+            abbrev = [t.replace("mempalace_", "mp:") for t in tool_names[:8]]
+            body_parts.append(f"Tools used: {', '.join(abbrev)}")
+            if len(tool_names) > 8:
+                body_parts.append(f"(+{len(tool_names) - 8} more)")
+
+        entry = entry_header + " " + ". ".join(body_parts) + "."
 
         # Use the same diary mechanism as _tool_diary_write
         room = "diary"
@@ -1930,7 +1933,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         )
         hits = result.get("results", []) if isinstance(result, dict) else []
 
-        # Filter out diary entries — AAAK session logs are not human-readable
+        # Filter out diary entries — session summaries pollute auto-recall
         hits = [h for h in hits if h.get("room") != "diary"]
 
         if not hits:
