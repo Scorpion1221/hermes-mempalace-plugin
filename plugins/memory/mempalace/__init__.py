@@ -93,6 +93,7 @@ MIN_RECALL_QUERY_LEN = 6  # skip very short prompts from recall
 CONTEXTUAL_FOLLOWUP_MESSAGES = frozenset({
     "continue", "go", "go on", "next", "继续",
 })
+HARD_SKIP_USER_MESSAGES = TRIVIAL_USER_MESSAGES - CONTEXTUAL_FOLLOWUP_MESSAGES
 
 ALL_TOOL_NAMES = [
     "mempalace_search",
@@ -996,11 +997,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # Skip recall for trivial prompts
         normalized = _normalize_user_message(query)
         previous_assistant_tail = self._previous_assistant_tail(state)
-        if normalized in TRIVIAL_USER_MESSAGES:
-            if not (
-                previous_assistant_tail and normalized in CONTEXTUAL_FOLLOWUP_MESSAGES
-            ):
-                return
+        if normalized in HARD_SKIP_USER_MESSAGES:
+            return
         if len(normalized) < MIN_RECALL_QUERY_LEN and not previous_assistant_tail:
             return
 
@@ -1865,21 +1863,33 @@ class MemPalaceMemoryProvider(MemoryProvider):
             search_query = f"{previous_assistant_tail}\n\n{query}"
         time_after = None
         try:
-            from mempalace.recall_llm import is_enabled, _get_llm_config, rewrite_query, rerank
+            from mempalace.recall_llm import is_enabled, _get_llm_config, decide_recall, rerank
             if is_enabled():
                 llm_config = _get_llm_config()
             if llm_config:
-                rewrite_result = rewrite_query(
+                recall_decision = decide_recall(
                     query,
                     config=llm_config,
                     previous_assistant_context={"tail": previous_assistant_tail},
+                    active_context={"wing": state.wing, "platform": state.platform},
                 )
-                if rewrite_result:
-                    search_query = rewrite_result["query"]
-                    time_after = rewrite_result.get("after")
-                    logger.info("Recall: query rewritten to %r, after=%s", search_query[:80], time_after)
+                if recall_decision:
+                    if not recall_decision.get("should_recall"):
+                        logger.info(
+                            "Recall: LLM skipped recall reason=%s",
+                            recall_decision.get("reason", "unknown"),
+                        )
+                        return ""
+                    search_query = recall_decision["query"]
+                    time_after = recall_decision.get("after")
+                    logger.info(
+                        "Recall: LLM decided recall reason=%s, query=%r, after=%s",
+                        recall_decision.get("reason", "unknown"),
+                        search_query[:80],
+                        time_after,
+                    )
         except Exception as e:
-            logger.info("Recall: query rewrite failed (%s), using original", e)
+            logger.info("Recall: decide+rewrite failed (%s), using fallback", e)
 
         pool_size = RECALL_POOL if llm_config else limit
         result = search_memories(

@@ -99,8 +99,11 @@ def test_sync_turn_does_not_create_default_home_mempalace(tmp_path: Path, monkey
     assert _collection_count(provider.resolved_paths.palace_path) == 1
 
 
-def test_prefetch_cache_is_session_keyed_and_wing_scoped(tmp_path: Path) -> None:
+def test_prefetch_cache_is_session_keyed_and_wing_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hermes_home = tmp_path / "profile"
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "0")
     provider = _provider(hermes_home, user_id="alice")
     collection = _get_collection(provider.resolved_paths.palace_path)
     collection.upsert(
@@ -691,9 +694,20 @@ def test_render_recall_passes_previous_assistant_context_to_llm_rewrite_and_rera
             ]
         }
 
-    def fake_rewrite_query(query, config=None, previous_assistant_context=None):
+    def fake_decide_recall(
+        query,
+        config=None,
+        previous_assistant_context=None,
+        active_context=None,
+    ):
         calls["rewrite"] = previous_assistant_context
-        return {"query": "mempalace hooks", "after": None}
+        calls["active_context"] = active_context
+        return {
+            "should_recall": True,
+            "reason": "short_followup_depends_on_previous_assistant",
+            "query": "mempalace hooks",
+            "after": None,
+        }
 
     def fake_rerank(query, hits, top_k=5, config=None, previous_assistant_context=None):
         calls["rerank"] = previous_assistant_context
@@ -702,7 +716,7 @@ def test_render_recall_passes_previous_assistant_context_to_llm_rewrite_and_rera
     monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
     monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
     monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
-    monkeypatch.setattr("mempalace.recall_llm.rewrite_query", fake_rewrite_query)
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide_recall)
     monkeypatch.setattr("mempalace.recall_llm.rerank", fake_rerank)
 
     recall = provider.prefetch("why?", session_id="session-1")
@@ -711,9 +725,38 @@ def test_render_recall_passes_previous_assistant_context_to_llm_rewrite_and_rera
     assert calls["rewrite"] == {
         "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
     }
+    assert calls["active_context"] == {"wing": "wing_coder", "platform": "cli"}
     assert calls["rerank"] == {
         "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
     }
+    provider.shutdown()
+
+
+def test_render_recall_llm_can_skip_recall_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "format this json", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Earlier I explained the hooks."
+
+    def fake_decide_recall(*args, **kwargs):
+        return {
+            "should_recall": False,
+            "reason": "direct_local_task_no_memory_needed",
+            "query": None,
+            "after": None,
+        }
+
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide_recall)
+    monkeypatch.setattr(
+        mempalace_plugin,
+        "search_memories",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("search should not run")),
+    )
+
+    assert provider.prefetch("format this json", session_id="session-1") == ""
     provider.shutdown()
 
 
