@@ -72,6 +72,7 @@ FIRST_TURN_RECALL_LIMIT = 5
 PREFETCH_RECALL_LIMIT = 5
 RECALL_POOL = 10  # over-fetch for LLM reranking
 MAX_RECALL_SNIPPET_CHARS = 400
+PREVIOUS_ASSISTANT_TAIL_CHARS = 500
 MAX_SYSTEM_PROMPT_PATH_CHARS = 120
 TRIVIAL_USER_MESSAGES = frozenset({
     # Greetings
@@ -89,6 +90,9 @@ TRIVIAL_USER_MESSAGES = frozenset({
     "done", "完成", "搞定", "stop", "quit", "exit",
 })
 MIN_RECALL_QUERY_LEN = 6  # skip very short prompts from recall
+CONTEXTUAL_FOLLOWUP_MESSAGES = frozenset({
+    "continue", "go", "go on", "next", "继续",
+})
 
 ALL_TOOL_NAMES = [
     "mempalace_search",
@@ -605,6 +609,7 @@ class SessionState:
     agent_context: str = "primary"
     allow_writes: bool = True
     last_user_query: str = ""
+    last_assistant_reply: str = ""
     prefetched_text: str = ""
     prefetch_future: Optional[Future[str]] = None
     pending_write_futures: List[Future[Any]] = field(default_factory=list)
@@ -703,6 +708,20 @@ def _truncate(text: str, limit: int = MAX_RECALL_SNIPPET_CHARS) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3].rstrip() + "..."
+
+
+def _tail_chars(text: str, limit: int) -> str:
+    if not text or limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _session_cache_filename(session_id: str) -> str:
+    slug = _slug(session_id)
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}_{digest}_last_assistant.txt"
 
 
 def _normalize_user_message(text: str) -> str:
@@ -976,7 +995,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         # Skip recall for trivial prompts
         normalized = _normalize_user_message(query)
-        if len(normalized) < MIN_RECALL_QUERY_LEN or normalized in TRIVIAL_USER_MESSAGES:
+        previous_assistant_tail = self._previous_assistant_tail(state)
+        if normalized in TRIVIAL_USER_MESSAGES:
+            if not (
+                previous_assistant_tail and normalized in CONTEXTUAL_FOLLOWUP_MESSAGES
+            ):
+                return
+        if len(normalized) < MIN_RECALL_QUERY_LEN and not previous_assistant_tail:
             return
 
         state.last_user_query = query
@@ -993,6 +1018,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
         state = self._get_session_state(session_id)
         if state is None or not state.allow_writes:
             return
+        cleaned_assistant = _strip_injected_memory(assistant_content)
+        with state.lock:
+            state.last_assistant_reply = cleaned_assistant
+        self._write_assistant_cache(state.session_id, cleaned_assistant)
         if _is_trivial_turn(user_content, assistant_content):
             return
 
@@ -1046,6 +1075,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 logger.debug("auto-diary failed: %s", exc)
 
         self._flush_session(session_id)
+        self._clear_assistant_cache(session_id)
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
 
@@ -1826,20 +1856,30 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not query.strip() or self._paths is None:
             return ""
 
+        previous_assistant_tail = self._previous_assistant_tail(state)
+
         # --- LLM-enhanced recall (opt-in via MEMPAL_RECALL_LLM=1) ---
         llm_config = None
         search_query = query
+        if previous_assistant_tail:
+            search_query = f"{previous_assistant_tail}\n\n{query}"
+        time_after = None
         try:
             from mempalace.recall_llm import is_enabled, _get_llm_config, rewrite_query, rerank
             if is_enabled():
                 llm_config = _get_llm_config()
             if llm_config:
-                rewritten = rewrite_query(query, config=llm_config)
-                if rewritten:
-                    logger.debug("Recall: query rewritten to %r", rewritten[:80])
-                    search_query = rewritten
+                rewrite_result = rewrite_query(
+                    query,
+                    config=llm_config,
+                    previous_assistant_context={"tail": previous_assistant_tail},
+                )
+                if rewrite_result:
+                    search_query = rewrite_result["query"]
+                    time_after = rewrite_result.get("after")
+                    logger.info("Recall: query rewritten to %r, after=%s", search_query[:80], time_after)
         except Exception as e:
-            logger.debug("Recall: query rewrite failed (%s), using original", e)
+            logger.info("Recall: query rewrite failed (%s), using original", e)
 
         pool_size = RECALL_POOL if llm_config else limit
         result = search_memories(
@@ -1848,23 +1888,34 @@ class MemPalaceMemoryProvider(MemoryProvider):
             wing=None,  # search all wings for broader recall
             preferred_wing=state.wing,  # soft-boost results from the active wing
             n_results=pool_size,
+            after=time_after,
         )
         hits = result.get("results", []) if isinstance(result, dict) else []
+
+        # Filter out diary entries — AAAK session logs are not human-readable
+        hits = [h for h in hits if h.get("room") != "diary"]
+
         if not hits:
             return ""
 
         # LLM rerank + relevance filter
         if llm_config and len(hits) > limit:
             try:
-                reranked = rerank(query, hits, top_k=limit, config=llm_config)
+                reranked = rerank(
+                    query,
+                    hits,
+                    top_k=limit,
+                    config=llm_config,
+                    previous_assistant_context={"tail": previous_assistant_tail},
+                )
                 if reranked is not None:
                     if len(reranked) == 0:
-                        logger.debug("Recall: LLM filtered all %d hits as irrelevant", len(hits))
+                        logger.info("Recall: LLM filtered all %d hits as irrelevant", len(hits))
                         return ""
-                    logger.debug("Recall: LLM reranked %d → %d", len(hits), len(reranked))
+                    logger.info("Recall: LLM reranked %d → %d", len(hits), len(reranked))
                     hits = reranked
             except Exception as e:
-                logger.debug("Recall: LLM rerank failed (%s), using BM25 order", e)
+                logger.info("Recall: LLM rerank failed (%s), using BM25 order", e)
 
         lines = ["## MemPalace Recall"]
         for hit in hits[:limit]:
@@ -1950,6 +2001,61 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return self._chroma_client.get_collection(COLLECTION_NAME)
         except Exception:
             return None
+
+    def _assistant_cache_dir(self) -> Path:
+        if self._paths is None:
+            raise RuntimeError("Provider not initialized")
+        return self._paths.base_dir / "session_state"
+
+    def _assistant_cache_path(self, session_id: str) -> Path:
+        return self._assistant_cache_dir() / _session_cache_filename(session_id)
+
+    def _write_assistant_cache(self, session_id: str, assistant_reply: str) -> None:
+        if self._paths is None or not session_id:
+            return
+        path = self._assistant_cache_path(session_id)
+        if not assistant_reply:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(assistant_reply, encoding="utf-8")
+        except OSError:
+            logger.debug("assistant cache write failed for %s", session_id, exc_info=True)
+
+    def _read_assistant_cache(self, session_id: str) -> str:
+        if self._paths is None or not session_id:
+            return ""
+        path = self._assistant_cache_path(session_id)
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            logger.debug("assistant cache read failed for %s", session_id, exc_info=True)
+            return ""
+
+    def _clear_assistant_cache(self, session_id: str) -> None:
+        if self._paths is None or not session_id:
+            return
+        path = self._assistant_cache_path(session_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("assistant cache clear failed for %s", session_id, exc_info=True)
+
+    def _previous_assistant_tail(self, state: SessionState) -> str:
+        with state.lock:
+            assistant_reply = state.last_assistant_reply
+        if not assistant_reply:
+            assistant_reply = self._read_assistant_cache(state.session_id)
+            if assistant_reply:
+                with state.lock:
+                    state.last_assistant_reply = assistant_reply
+        return _tail_chars(assistant_reply, PREVIOUS_ASSISTANT_TAIL_CHARS)
 
     def _content_drawer_id(self, wing: str, room: str, content: str) -> str:
         digest = hashlib.sha256(f"{wing}:{room}:{content}".encode("utf-8")).hexdigest()[:24]

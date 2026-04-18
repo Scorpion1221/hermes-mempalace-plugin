@@ -19,6 +19,7 @@ This repo is used to:
 - implement the provider against the Hermes `MemoryProvider` contract
 - run local tests against explicit path resolution, session scoping, write gating, and wing filtering
 - keep migration notes clear before landing the code into Hermes
+- stage runtime rollouts when the Hermes in-tree plugin is not symlinked to this repo
 
 Key implementation files:
 
@@ -29,3 +30,17 @@ Key implementation files:
 - `tests/test_mempalace_provider.py` — local verification suite
 
 See [docs/plan.md](docs/plan.md) for the planning history behind this workspace.
+
+## Current recall behavior
+
+The Hermes MemPalace provider now carries forward the **previous
+assistant reply** as structured recall context:
+
+- `sync_turn()` stores the cleaned assistant reply in session memory
+- the same reply is also written to a session cache file under the
+  active Hermes profile so gateway restarts can recover it
+- recall uses the tail of that reply (500 chars) when rewriting and
+  reranking the next user query
+
+This makes short follow-ups like “why?” and “continue” recall the right
+MemPalace drawers without relying on transcript scraping at recall time.

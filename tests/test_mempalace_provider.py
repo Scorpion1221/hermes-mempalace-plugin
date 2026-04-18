@@ -8,6 +8,7 @@ import chromadb
 import pytest
 from mempalace.knowledge_graph import KnowledgeGraph
 
+import plugins.memory.mempalace as mempalace_plugin
 from plugins.memory.mempalace import MemPalaceMemoryProvider, register, resolve_paths
 
 
@@ -116,8 +117,10 @@ def test_prefetch_cache_is_session_keyed_and_wing_scoped(tmp_path: Path) -> None
     provider.queue_prefetch("espresso", session_id="session-a")
     provider.queue_prefetch("tea", session_id="session-b")
 
-    provider._sessions["session-a"].prefetch_future.result(timeout=10)
-    provider._sessions["session-b"].prefetch_future.result(timeout=10)
+    if provider._sessions["session-a"].prefetch_future is not None:
+        provider._sessions["session-a"].prefetch_future.result(timeout=10)
+    if provider._sessions["session-b"].prefetch_future is not None:
+        provider._sessions["session-b"].prefetch_future.result(timeout=10)
 
     recall_a = provider.prefetch("espresso", session_id="session-a")
     recall_b = provider.prefetch("tea", session_id="session-b")
@@ -209,7 +212,7 @@ def test_first_turn_prefetch_is_bounded(tmp_path: Path) -> None:
     recall = provider.prefetch("Alice memory", session_id="session-1")
 
     assert recall.startswith("## MemPalace Recall")
-    assert recall.count("\n- [") <= 3
+    assert recall.count("\n- [") <= mempalace_plugin.FIRST_TURN_RECALL_LIMIT
 
 
 def test_tool_outputs_are_json_and_kg_query_is_structured(tmp_path: Path) -> None:
@@ -584,3 +587,253 @@ def test_hook_settings_read(tmp_path: Path) -> None:
     # Should return current settings without error
     assert "hook_silent_save" in result or "error" in result
     provider.shutdown()
+
+
+def test_sync_turn_caches_previous_assistant_reply_for_session(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider.sync_turn(
+        "why?",
+        "<<MEMORY_CONTEXT>>\nignore this\n<</MEMORY_CONTEXT>>\nReal assistant reply",
+        session_id="session-1",
+    )
+
+    assert provider._sessions["session-1"].last_assistant_reply == "Real assistant reply"
+    cache_dir = provider.resolved_paths.base_dir / "session_state"
+    cache_files = list(cache_dir.glob("*_last_assistant.txt"))
+    assert len(cache_files) == 1
+    assert cache_files[0].read_text(encoding="utf-8") == "Real assistant reply"
+    provider.shutdown()
+
+
+def test_render_recall_includes_previous_assistant_context_in_fallback_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = (
+        "Earlier I explained the MemPalace Claude and Codex hooks."
+    )
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": "Matching memory"}
+            ]
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "0")
+
+    recall = provider.prefetch("why?", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert captured["query"] == (
+        "Earlier I explained the MemPalace Claude and Codex hooks.\n\nwhy?"
+    )
+    provider.shutdown()
+
+
+def test_render_recall_uses_file_fallback_when_memory_state_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    cache_path = provider._assistant_cache_path("session-1")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        "Earlier I explained the MemPalace Claude and Codex hooks.",
+        encoding="utf-8",
+    )
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": "Matching memory"}
+            ]
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "0")
+
+    recall = provider.prefetch("why?", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert provider._sessions["session-1"].last_assistant_reply == (
+        "Earlier I explained the MemPalace Claude and Codex hooks."
+    )
+    assert captured["query"] == (
+        "Earlier I explained the MemPalace Claude and Codex hooks.\n\nwhy?"
+    )
+    provider.shutdown()
+
+
+def test_render_recall_passes_previous_assistant_context_to_llm_rewrite_and_rerank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = (
+        "Earlier I explained the MemPalace Claude and Codex hooks."
+    )
+
+    calls = {}
+
+    def fake_search_memories(**kwargs):
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": f"hit {i}"}
+                for i in range(6)
+            ]
+        }
+
+    def fake_rewrite_query(query, config=None, previous_assistant_context=None):
+        calls["rewrite"] = previous_assistant_context
+        return {"query": "mempalace hooks", "after": None}
+
+    def fake_rerank(query, hits, top_k=5, config=None, previous_assistant_context=None):
+        calls["rerank"] = previous_assistant_context
+        return hits[:top_k]
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.rewrite_query", fake_rewrite_query)
+    monkeypatch.setattr("mempalace.recall_llm.rerank", fake_rerank)
+
+    recall = provider.prefetch("why?", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert calls["rewrite"] == {
+        "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
+    }
+    assert calls["rerank"] == {
+        "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
+    }
+    provider.shutdown()
+
+
+def test_queue_prefetch_allows_short_followup_when_previous_assistant_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Earlier I explained the hooks."
+
+    submitted = {}
+
+    def fake_submit(fn, query, state, limit):
+        submitted["query"] = query
+        submitted["session_id"] = state.session_id
+        submitted["limit"] = limit
+
+        class DummyFuture:
+            def done(self):
+                return False
+
+        return DummyFuture()
+
+    monkeypatch.setattr(
+        provider,
+        "_executor",
+        type(
+            "Exec",
+            (),
+            {
+                "submit": staticmethod(fake_submit),
+                "shutdown": staticmethod(lambda **kwargs: None),
+            },
+        )(),
+    )
+
+    provider.queue_prefetch("why?", session_id="session-1")
+
+    assert submitted["query"] == "why?"
+    assert submitted["session_id"] == "session-1"
+    assert submitted["limit"] == mempalace_plugin.PREFETCH_RECALL_LIMIT
+    provider.shutdown()
+
+
+def test_queue_prefetch_still_skips_acknowledgement_even_with_previous_assistant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "ok", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Earlier I explained the hooks."
+
+    called = {"submit": False}
+
+    def fake_submit(*args, **kwargs):
+        called["submit"] = True
+        raise AssertionError("submit should not be called for pure ack")
+
+    monkeypatch.setattr(
+        provider,
+        "_executor",
+        type(
+            "Exec",
+            (),
+            {
+                "submit": staticmethod(fake_submit),
+                "shutdown": staticmethod(lambda **kwargs: None),
+            },
+        )(),
+    )
+
+    provider.queue_prefetch("ok", session_id="session-1")
+
+    assert called["submit"] is False
+    provider.shutdown()
+
+
+def test_on_session_end_clears_assistant_cache_file(tmp_path: Path) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider.sync_turn("why?", "Assistant reply to cache", session_id="session-1")
+    cache_path = provider._assistant_cache_path("session-1")
+    assert cache_path.exists()
+
+    provider.on_session_end(
+        [
+            {"role": "user", "content": "why?"},
+            {"role": "assistant", "content": "Assistant reply to cache"},
+        ]
+    )
+
+    assert not cache_path.exists()
+
+
+def test_shutdown_preserves_assistant_cache_file_for_process_restart(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "profile"
+    provider = _provider(hermes_home)
+    provider.on_turn_start(0, "why?", session_id="session-1")
+    provider.sync_turn("why?", "Assistant reply to persist", session_id="session-1")
+    cache_path = provider._assistant_cache_path("session-1")
+    assert cache_path.exists()
+    provider.shutdown()
+
+    provider2 = _provider(hermes_home, session_id="session-1")
+    provider2.on_turn_start(0, "why?", session_id="session-1")
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": "Matching memory"}
+            ]
+        }
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+        mp.setenv("MEMPAL_RECALL_LLM", "0")
+        recall = provider2.prefetch("why?", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert captured["query"] == "Assistant reply to persist\n\nwhy?"
+    provider2.shutdown()

@@ -25,6 +25,8 @@ landing point remains the Hermes repository.
 - `_bounded_int()` helper for clamped integer parsing
 - `_get_collection(create=False)` returns `None` instead of raising when collection doesn't exist
 - `_json_result` uses `default=str` for safe datetime serialization
+- carries forward the previous assistant reply as recall context for the next turn
+- uses memory-first + file-fallback session caches for previous assistant context
 
 ## Default Paths
 
@@ -37,6 +39,18 @@ Unless overridden in `$HERMES_HOME/mempalace.json`, the provider resolves:
 
 The provider always passes resolved explicit paths into MemPalace entrypoints. It
 does not intentionally fall back to `~/.mempalace/*`.
+
+Previous-assistant context cache files live under the profile-scoped base dir:
+
+- `$HERMES_HOME/mempalace/session_state/<slug>_<hash>_last_assistant.txt`
+
+The runtime flow is:
+
+1. `sync_turn()` stores the assistant reply in `SessionState.last_assistant_reply`
+2. the same reply is written to the session-state file
+3. recall reads memory first, then the file cache if the process restarted
+4. `on_session_end()` deletes the cache file, while bare process shutdown leaves
+   it in place so the next process can recover continuity
 
 ## Setup
 
@@ -70,6 +84,14 @@ Relative config paths are resolved from the active `HERMES_HOME`.
 | `mempalace_search` | Semantic search over drawers in the active wing |
 | `mempalace_kg_query` | Query temporal facts from the profile-scoped KG |
 | `mempalace_remember` | Explicitly persist a durable memory drawer |
+
+Recall for normal turns uses:
+
+- current user message as the primary signal
+- previous assistant reply tail (500 chars) as optional structured context
+
+Short follow-up prompts like “why?” and “continue” are allowed into recall when
+previous assistant context exists; pure acknowledgements like “ok” still skip.
 
 ### Knowledge Graph
 | Tool | Description |
