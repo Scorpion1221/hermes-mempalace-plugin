@@ -760,6 +760,51 @@ def test_render_recall_llm_can_skip_recall_entirely(
     provider.shutdown()
 
 
+def test_render_recall_session_local_continue_skips_without_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "继续推进，直到完全修复完成", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Earlier I explained the hooks."
+
+    monkeypatch.setattr(
+        mempalace_plugin,
+        "search_memories",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("search should not run")),
+    )
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "0")
+
+    assert provider.prefetch("继续推进，直到完全修复完成", session_id="session-1") == ""
+    provider.shutdown()
+
+
+def test_render_recall_history_continue_can_still_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "按之前那个方案继续推进", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Earlier I explained the hooks."
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": "Matching memory"}
+            ]
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "0")
+
+    recall = provider.prefetch("按之前那个方案继续推进", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert captured["query"].endswith("\n\n按之前那个方案继续推进")
+    provider.shutdown()
+
+
 def test_queue_prefetch_allows_short_followup_when_previous_assistant_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1001,6 +1001,18 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return
         if len(normalized) < MIN_RECALL_QUERY_LEN and not previous_assistant_tail:
             return
+        try:
+            from mempalace.recall_llm import local_recall_decision
+
+            local_decision = local_recall_decision(
+                query,
+                previous_assistant_context={"tail": previous_assistant_tail},
+                active_context={"wing": state.wing, "platform": state.platform},
+            )
+            if local_decision and not local_decision.get("should_recall"):
+                return
+        except Exception:
+            pass
 
         state.last_user_query = query
         future = self._executor.submit(
@@ -1855,6 +1867,22 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return ""
 
         previous_assistant_tail = self._previous_assistant_tail(state)
+        try:
+            from mempalace.recall_llm import local_recall_decision
+
+            local_decision = local_recall_decision(
+                query,
+                previous_assistant_context={"tail": previous_assistant_tail},
+                active_context={"wing": state.wing, "platform": state.platform},
+            )
+            if local_decision and not local_decision.get("should_recall"):
+                logger.info(
+                    "Recall: local skip reason=%s",
+                    local_decision.get("reason", "unknown"),
+                )
+                return ""
+        except Exception:
+            pass
 
         # --- LLM-enhanced recall (opt-in via MEMPAL_RECALL_LLM=1) ---
         llm_config = None
