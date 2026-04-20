@@ -1147,62 +1147,88 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     seen.add(token)
         return keywords[:max_keywords]
 
-    def _auto_diary(self, state: "SessionState", messages: List[Dict[str, Any]]) -> None:
-        """Write a natural language diary entry summarising the session.
+    def _llm_diary_entry(
+        self,
+        user_texts: list,
+        assistant_texts: list,
+        tool_names: list,
+        user_turns: int,
+        today: str,
+        now_ts: str,
+        state: "SessionState",
+    ) -> str:
+        """Use Haiku to write a natural language diary entry. Returns empty on failure."""
+        try:
+            from mempalace.recall_llm import is_enabled, _get_llm_config, _call_llm
+        except ImportError:
+            return ""
+        if not is_enabled():
+            return ""
+        config = _get_llm_config()
+        if not config:
+            return ""
 
-        Extracts: tool calls, user topics, keywords, decisions, turn count.
-        No LLM needed — pure extraction from message history.
-        Mirrors the Claude Code Stop-hook pattern but runs server-side.
-        Output is plain natural language for better vector search recall.
-        """
-        agent_name = state.agent_identity or "hermes"
-        today = datetime.now().strftime("%Y-%m-%d")
-        now_ts = datetime.now().strftime("%H%M")
+        # Build a compact conversation summary for the prompt
+        # Take first 3 + last 3 user messages, and last 3 assistant messages
+        sample_user = user_texts[:3]
+        if len(user_texts) > 6:
+            sample_user += user_texts[-3:]
+        elif len(user_texts) > 3:
+            sample_user += user_texts[3:]
+        sample_assistant = assistant_texts[-3:]
 
-        # Pass 1: collect structured data from all messages
-        user_turns = 0
-        tool_names: list = []
-        user_texts: list = []
-        assistant_texts: list = []
-        first_user_msg = ""
-        last_user_msg = ""
+        user_block = "\n".join(f"- {t[:200]}" for t in sample_user)
+        assistant_block = "\n".join(f"- {t[:300]}" for t in sample_assistant)
+        tools_str = ", ".join(tool_names[:10]) if tool_names else "(none)"
 
-        for msg in messages:
-            role = msg.get("role", "")
-            if role == "user":
-                user_turns += 1
-                text = self._extract_msg_text(msg)
-                if self._is_user_content(text):
-                    user_texts.append(text)
-                    if not first_user_msg:
-                        first_user_msg = text[:120]
-                    last_user_msg = text[:120]
-            elif role == "assistant":
-                text = self._extract_msg_text(msg)
-                if text and len(text) > 20:
-                    assistant_texts.append(text)
-                # Collect tool calls
-                tc = msg.get("tool_calls") or []
-                for call in tc:
-                    fn = call.get("function", {}).get("name", "")
-                    if fn and fn not in tool_names:
-                        tool_names.append(fn)
+        # Detect dominant language from user messages
+        sample_text = " ".join(t[:50] for t in user_texts[:3])
+        has_cjk = any("\u4e00" <= c <= "\u9fff" for c in sample_text)
+        lang_hint = "Write in Chinese (中文)" if has_cjk else "Write in English"
 
-        # Skip trivial sessions (< 3 user turns)
-        if user_turns < 3:
-            return
+        prompt = (
+            f"Write a concise diary entry for an AI session that happened on {today}.\n"
+            f"{lang_hint}. Write in plain natural language for best search recall.\n"
+            f"Focus on: what was discussed, key decisions made, actions taken, outcomes.\n"
+            f"Do NOT include metadata headers or formatting. Just 2-4 sentences.\n\n"
+            f"Session info: {user_turns} user turns, platform: {state.platform or 'cli'}\n"
+            f"Tools used: {tools_str}\n\n"
+            f"User messages (sample):\n{user_block}\n\n"
+            f"Assistant responses (recent):\n{assistant_block}\n\n"
+            f"Diary entry:"
+        )
 
-        # Pass 2: extract searchable keywords from user messages
+        try:
+            result = _call_llm(config, prompt, max_tokens=300, timeout=10)
+            if result and len(result.strip()) > 20:
+                return result.strip()
+        except Exception as e:
+            logger.debug("LLM diary generation failed: %s", e)
+
+        return ""
+
+    def _regex_diary_entry(
+        self,
+        user_texts: list,
+        assistant_texts: list,
+        tool_names: list,
+        user_turns: int,
+        first_user_msg: str,
+        last_user_msg: str,
+        today: str,
+        now_ts: str,
+        state: "SessionState",
+    ) -> str:
+        """Fallback: build diary entry from regex extraction."""
         keywords = self._extract_keywords(user_texts)
 
-        # Pass 3: extract key actions/decisions from assistant messages
-        actions: list = []
         import re as _re
+        actions: list = []
         action_patterns = [
             _re.compile(r'(?:已|完成|修复|修好|创建|添加|删除|更新|部署|重启|提交|推送)了?\s*[`\u4e00-\u9fff\w._/-]{2,40}'),
             _re.compile(r'(?:✅|✓|☑)\s*.{5,60}'),
         ]
-        for text in assistant_texts[-6:]:  # focus on recent assistant turns
+        for text in assistant_texts[-6:]:
             for pat in action_patterns:
                 for m in pat.finditer(text):
                     action = m.group().strip()
@@ -1211,19 +1237,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         if len(actions) >= 5:
                             break
 
-        # Build natural language entry
-        topic_slug = (
-            first_user_msg[:80]
-            .replace("\n", " ")
-            .replace("|", "/")
-            .strip()
-        )
-        last_slug = (
-            last_user_msg[:80]
-            .replace("\n", " ")
-            .replace("|", "/")
-            .strip()
-        )
+        topic_slug = first_user_msg[:80].replace("\n", " ").replace("|", "/").strip()
+        last_slug = last_user_msg[:80].replace("\n", " ").replace("|", "/").strip()
 
         parts = [f"Session on {today} at {now_ts}"]
         if state.platform:
@@ -1243,12 +1258,68 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if tool_names:
             abbrev = [t.replace("mempalace_", "mp:") for t in tool_names[:8]]
             body_parts.append(f"Tools used: {', '.join(abbrev)}")
-            if len(tool_names) > 8:
-                body_parts.append(f"(+{len(tool_names) - 8} more)")
 
-        entry = entry_header + " " + ". ".join(body_parts) + "."
+        return entry_header + " " + ". ".join(body_parts) + "."
 
-        # Use the same diary mechanism as _tool_diary_write
+    def _auto_diary(self, state: "SessionState", messages: List[Dict[str, Any]]) -> None:
+        """Write a natural language diary entry summarising the session.
+
+        Two-tier approach:
+        1. LLM (Haiku) — produces high-quality natural language summary
+           in the user's language for best vector search recall.
+        2. Regex fallback — pure extraction when LLM is unavailable.
+        """
+        agent_name = state.agent_identity or "hermes"
+        today = datetime.now().strftime("%Y-%m-%d")
+        now_ts = datetime.now().strftime("%H%M")
+
+        # Collect structured data from messages
+        user_turns = 0
+        user_texts: list = []
+        assistant_texts: list = []
+        tool_names: list = []
+        first_user_msg = ""
+        last_user_msg = ""
+
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "user":
+                user_turns += 1
+                text = self._extract_msg_text(msg)
+                if self._is_user_content(text):
+                    user_texts.append(text)
+                    if not first_user_msg:
+                        first_user_msg = text[:120]
+                    last_user_msg = text[:120]
+            elif role == "assistant":
+                text = self._extract_msg_text(msg)
+                if text and len(text) > 20:
+                    assistant_texts.append(text)
+                tc = msg.get("tool_calls") or []
+                for call in tc:
+                    fn = call.get("function", {}).get("name", "")
+                    if fn and fn not in tool_names:
+                        tool_names.append(fn)
+
+        if user_turns < 3:
+            return
+
+        # Try LLM-based diary first
+        entry = self._llm_diary_entry(
+            user_texts, assistant_texts, tool_names, user_turns,
+            today, now_ts, state,
+        )
+
+        # Fallback to regex extraction
+        if not entry:
+            entry = self._regex_diary_entry(
+                user_texts, assistant_texts, tool_names, user_turns,
+                first_user_msg, last_user_msg, today, now_ts, state,
+            )
+
+        if not entry:
+            return
+
         room = "diary"
         drawer_id = f"diary_{_slug(agent_name)}_{today}_{now_ts}"
 
