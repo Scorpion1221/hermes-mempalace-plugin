@@ -1940,11 +1940,26 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         time_after,
                     )
                 else:
-                    logger.info("Recall: LLM decide returned None, fail closed")
-                    return ""
+                    from mempalace.recall_llm import _HISTORY_REFERENCE_HINTS
+
+                    has_history_ref = any(h in query.lower() for h in _HISTORY_REFERENCE_HINTS)
+                    if has_history_ref:
+                        logger.info("Recall: LLM decide returned None, but history ref detected — fallback to search")
+                    else:
+                        logger.info("Recall: LLM decide returned None, fail closed")
+                        return ""
         except Exception as e:
-            logger.info("Recall: decide+rewrite failed (%s), fail closed", e)
-            return ""
+            try:
+                from mempalace.recall_llm import _HISTORY_REFERENCE_HINTS
+
+                has_history_ref = any(h in query.lower() for h in _HISTORY_REFERENCE_HINTS)
+            except Exception:
+                has_history_ref = False
+            if has_history_ref:
+                logger.info("Recall: decide+rewrite failed (%s), but history ref detected — fallback to search", e)
+            else:
+                logger.info("Recall: decide+rewrite failed (%s), fail closed", e)
+                return ""
 
         if _budget_exceeded():
             logger.info("Recall: budget exceeded after LLM decide, bailing")
