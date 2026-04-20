@@ -1169,13 +1169,15 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return ""
 
         # Build a compact conversation summary for the prompt
-        # Take first 3 + last 3 user messages, and last 3 assistant messages
-        sample_user = user_texts[:3]
-        if len(user_texts) > 6:
-            sample_user += user_texts[-3:]
-        elif len(user_texts) > 3:
-            sample_user += user_texts[3:]
-        sample_assistant = assistant_texts[-3:]
+        # Sample more messages for longer sessions to capture breadth
+        max_user_samples = min(10, len(user_texts))
+        if len(user_texts) <= max_user_samples:
+            sample_user = user_texts
+        else:
+            half = max_user_samples // 2
+            sample_user = user_texts[:half] + user_texts[-half:]
+        max_assistant_samples = min(6, len(assistant_texts))
+        sample_assistant = assistant_texts[-max_assistant_samples:]
 
         user_block = "\n".join(f"- {t[:200]}" for t in sample_user)
         assistant_block = "\n".join(f"- {t[:300]}" for t in sample_assistant)
@@ -1187,10 +1189,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         lang_hint = "Write in Chinese (中文)" if has_cjk else "Write in English"
 
         prompt = (
-            f"Write a concise diary entry for an AI session that happened on {today}.\n"
+            f"Write a detailed diary entry for an AI session on {today}.\n"
             f"{lang_hint}. Write in plain natural language for best search recall.\n"
-            f"Focus on: what was discussed, key decisions made, actions taken, outcomes.\n"
-            f"Do NOT include metadata headers or formatting. Just 2-4 sentences.\n\n"
+            f"Include: what topics were discussed, key decisions made, specific actions taken, "
+            f"technical details that would be useful to recall later, file paths or commands mentioned, "
+            f"and outcomes/results. Be thorough — capture specifics, not just summaries.\n"
+            f"Do NOT include metadata headers or formatting. Write as flowing paragraphs.\n\n"
             f"Session info: {user_turns} user turns, platform: {state.platform or 'cli'}\n"
             f"Tools used: {tools_str}\n\n"
             f"User messages (sample):\n{user_block}\n\n"
@@ -1199,7 +1203,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         )
 
         try:
-            result = _call_llm(config, prompt, max_tokens=300, timeout=10)
+            max_tokens = min(800, max(300, user_turns * 40))
+            result = _call_llm(config, prompt, max_tokens=max_tokens, timeout=15)
             if result and len(result.strip()) > 20:
                 return result.strip()
         except Exception as e:
