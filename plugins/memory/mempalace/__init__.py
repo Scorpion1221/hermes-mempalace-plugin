@@ -1869,6 +1869,26 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not query.strip() or self._paths is None:
             return ""
 
+        import time as _time
+
+        _budget_start = _time.monotonic()
+        _BUDGET_SECONDS = 15
+
+        def _budget_exceeded():
+            return (_time.monotonic() - _budget_start) > _BUDGET_SECONDS
+
+        # Skip system/internal prompts
+        query_lower_head = query[:200].lower()
+        _SYSTEM_MARKERS = (
+            "you are a helpful assistant",
+            "generate a short title",
+            "hook timed out",
+            "hook (failed)",
+        )
+        for marker in _SYSTEM_MARKERS:
+            if marker in query_lower_head:
+                return ""
+
         previous_assistant_tail = self._previous_assistant_tail(state)
         try:
             from mempalace.recall_llm import local_recall_decision
@@ -1919,8 +1939,16 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         search_query[:80],
                         time_after,
                     )
+                else:
+                    logger.info("Recall: LLM decide returned None, fail closed")
+                    return ""
         except Exception as e:
-            logger.info("Recall: decide+rewrite failed (%s), using fallback", e)
+            logger.info("Recall: decide+rewrite failed (%s), fail closed", e)
+            return ""
+
+        if _budget_exceeded():
+            logger.info("Recall: budget exceeded after LLM decide, bailing")
+            return ""
 
         pool_size = RECALL_POOL if llm_config else limit
         result = search_memories(
@@ -1940,7 +1968,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return ""
 
         # LLM rerank + relevance filter
-        if llm_config and len(hits) > limit:
+        if llm_config and len(hits) > limit and not _budget_exceeded():
             try:
                 reranked = rerank(
                     query,
