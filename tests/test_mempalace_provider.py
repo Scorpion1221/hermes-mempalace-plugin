@@ -96,7 +96,10 @@ def test_sync_turn_does_not_create_default_home_mempalace(tmp_path: Path, monkey
     provider.shutdown()
 
     assert not (fake_home / ".mempalace").exists()
-    assert _collection_count(provider.resolved_paths.palace_path) == 1
+    # Per-turn raw drawers were removed in favour of Haiku-extracted batches
+    # (see _haiku_save_recent_turns); without an LLM configured nothing is
+    # written until on_session_end fires the auto-diary path.
+    assert _collection_count(provider.resolved_paths.palace_path) == 0
 
 
 def test_prefetch_cache_is_session_keyed_and_wing_scoped(
@@ -143,10 +146,12 @@ def test_sync_turn_is_idempotent_for_same_session_and_turn(tmp_path: Path) -> No
     provider.sync_turn("keep it", "stored once", session_id="session-1")
     provider.shutdown()
 
+    # Per-turn writes were replaced by Haiku-extracted periodic saves, which
+    # require an LLM config. Without one, repeated sync_turn calls simply
+    # accumulate in the in-memory buffer and never reach Chroma.
     collection = _get_collection(provider.resolved_paths.palace_path)
     stored = collection.get(include=["documents", "metadatas"])
-    assert len(stored["ids"]) == 1
-    assert stored["metadatas"][0]["turn_number"] == 7
+    assert stored["ids"] == []
 
 
 @pytest.mark.parametrize("context_name", ["subagent", "cron", "flush"])
@@ -725,7 +730,16 @@ def test_render_recall_passes_previous_assistant_context_to_llm_rewrite_and_rera
     assert calls["rewrite"] == {
         "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
     }
-    assert calls["active_context"] == {"wing": "wing_coder", "platform": "cli"}
+    # active_context now carries the Hermes session hints (wing/platform)
+    # plus, when available, palace taxonomy + KG entities (see
+    # MemPalaceMemoryProvider._build_recall_active_context). The exact
+    # taxonomy/entities depend on whatever's in the user's palace at test
+    # time, so we only assert the stable fields the gate actually relies
+    # on for filter selection.
+    active_ctx = calls["active_context"]
+    assert isinstance(active_ctx, dict)
+    assert active_ctx["wing"] == "wing_coder"
+    assert active_ctx["platform"] == "cli"
     assert calls["rerank"] == {
         "tail": "Earlier I explained the MemPalace Claude and Codex hooks."
     }
@@ -925,3 +939,376 @@ def test_shutdown_preserves_assistant_cache_file_for_process_restart(tmp_path: P
     assert "## MemPalace Recall" in recall
     assert captured["query"] == "Assistant reply to persist\n\nwhy?"
     provider2.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# New tests: recall filter forwarding, active_context enrichment, Haiku save
+# ---------------------------------------------------------------------------
+
+
+def test_recall_filter_forwarding_valid_room_and_hall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If decide_recall returns valid filters, search_memories receives them."""
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "show notes", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Sure."
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        # Note: post-search filter strips room=='diary' from the rendered
+        # output, so we return a non-diary hit here. The test asserts on
+        # what was passed INTO search_memories, not what came out.
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "decisions", "text": "Past decisions log"}
+            ]
+        }
+
+    def fake_decide_recall(query, config=None, previous_assistant_context=None, active_context=None):
+        return {
+            "should_recall": True,
+            "reason": "history_reference",
+            "query": "decisions",
+            "after": None,
+            "filters": {"room": "decisions", "hall": "hall_decisions"},
+        }
+
+    def fake_build_active_context(self_arg, state):
+        return {
+            "wing": state.wing,
+            "platform": state.platform,
+            "palace": {
+                "rooms": ["decisions", "general", "facts"],
+                "halls": ["hall_decisions", "general"],
+            },
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide_recall)
+    monkeypatch.setattr(
+        mempalace_plugin.MemPalaceMemoryProvider,
+        "_build_recall_active_context",
+        fake_build_active_context,
+    )
+
+    recall = provider.prefetch("show notes", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert captured.get("room") == "decisions"
+    assert captured.get("hall") == "hall_decisions"
+    provider.shutdown()
+
+
+def test_recall_filter_validation_drops_hallucinated_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filters with non-existent values are stripped (no room in search_memories)."""
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "show fictional", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Sure."
+
+    captured = {}
+
+    def fake_search_memories(**kwargs):
+        captured.update(kwargs)
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "general", "text": "some result"}
+            ]
+        }
+
+    def fake_decide_recall(query, config=None, previous_assistant_context=None, active_context=None):
+        return {
+            "should_recall": True,
+            "reason": "history_reference",
+            "query": "fictional room query",
+            "after": None,
+            "filters": {"room": "fictional_room"},
+        }
+
+    def fake_build_active_context(self_arg, state):
+        return {
+            "wing": state.wing,
+            "platform": state.platform,
+            "palace": {"rooms": ["diary", "general", "facts"], "halls": []},
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide_recall)
+    monkeypatch.setattr(
+        mempalace_plugin.MemPalaceMemoryProvider,
+        "_build_recall_active_context",
+        fake_build_active_context,
+    )
+
+    recall = provider.prefetch("show fictional", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    # "fictional_room" was not in the taxonomy, so it should NOT be
+    # forwarded to search_memories.
+    assert "room" not in captured
+    provider.shutdown()
+
+
+def test_active_context_enrichment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """decide_recall receives active_context with palace + entities keys."""
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "where is the config?", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = "Let me look."
+
+    ctx_captured = {}
+
+    def fake_search(**kwargs):
+        return {"results": [{"wing": "w", "room": "r", "text": "t"}]}
+
+    def fake_decide(query, config=None, previous_assistant_context=None, active_context=None):
+        ctx_captured.update(active_context if isinstance(active_context, dict) else {"raw": active_context})
+        return {
+            "should_recall": True,
+            "reason": "test",
+            "query": "config",
+            "after": None,
+        }
+
+    def fake_active_ctx(self_arg, state):
+        return {
+            "wing": state.wing,
+            "platform": state.platform,
+            "palace": {"rooms": ["general"], "halls": ["general"]},
+            "entities": ["Alice", "Bob"],
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search)
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide)
+    monkeypatch.setattr(
+        mempalace_plugin.MemPalaceMemoryProvider,
+        "_build_recall_active_context",
+        fake_active_ctx,
+    )
+
+    provider.prefetch("where is the config?", session_id="session-1")
+
+    assert "palace" in ctx_captured
+    assert "rooms" in ctx_captured["palace"]
+    assert "entities" in ctx_captured
+    assert "Alice" in ctx_captured["entities"]
+    provider.shutdown()
+
+
+def test_haiku_save_trigger_after_n_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_haiku_save_recent_turns runs after MEMPAL_HERMES_SAVE_INTERVAL turns."""
+    monkeypatch.setenv("MEMPAL_HERMES_SAVE_INTERVAL", "3")
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "1")
+
+    provider = _provider(tmp_path / "profile")
+
+    # Stub LLM to return a known JSON
+    fixed_json = json.dumps({
+        "diary": "User discussed project alpha and decided on a rewrite.",
+        "drawers": [
+            {"wing": "wing_alpha", "room": "decisions", "content": "Decided to rewrite the auth module from scratch."},
+        ],
+        "kg": [
+            {"subject": "user", "predicate": "decided", "object": "auth_rewrite"},
+        ],
+    })
+
+    def fake_call_llm(config, prompt, max_tokens=None, timeout=None, json_mode=False):
+        return fixed_json
+
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "mempalace.recall_llm._get_llm_config",
+        lambda: {"backend": "stub", "model": "h", "key": "k", "endpoint": "e"},
+    )
+    monkeypatch.setattr("mempalace.recall_llm._call_llm", fake_call_llm)
+
+    # Simulate 3 sync_turn calls
+    for i in range(3):
+        provider.on_turn_start(i, f"user message {i}", session_id="session-1")
+        provider.sync_turn(
+            f"user message {i}",
+            f"assistant reply {i} which is long enough to not be trivial",
+            session_id="session-1",
+        )
+
+    provider.shutdown()
+
+    # Verify drawers were written
+    collection = _get_collection(provider.resolved_paths.palace_path)
+    stored = collection.get(include=["documents", "metadatas"])
+    haiku_entries = [
+        m for m in stored["metadatas"] if m.get("added_by") == "haiku_async_save"
+    ]
+    assert len(haiku_entries) >= 1, f"Expected Haiku-extracted drawers, got {stored['ids']}"
+    # At least the diary + 1 drawer
+    rooms_written = {m.get("room") for m in haiku_entries}
+    assert "diary" in rooms_written or "decisions" in rooms_written
+
+    # Verify KG triple was written
+    kg = KnowledgeGraph(db_path=str(provider.resolved_paths.kg_path))
+    try:
+        facts = kg.query_entity("user", direction="outgoing")
+        assert any(f.get("predicate") == "decided" for f in facts)
+    finally:
+        kg.close()
+
+    provider.shutdown()
+
+
+def test_haiku_save_malformed_json_dumps_failure_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the LLM returns invalid JSON, a hermes_save_fail_*.txt is created."""
+    monkeypatch.setenv("MEMPAL_HERMES_SAVE_INTERVAL", "1")
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "1")
+
+    provider = _provider(tmp_path / "profile")
+
+    def fake_call_llm(config, prompt, max_tokens=None, timeout=None, json_mode=False):
+        return "This is not JSON { broken {"
+
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "mempalace.recall_llm._get_llm_config",
+        lambda: {"backend": "stub", "model": "h", "key": "k", "endpoint": "e"},
+    )
+    monkeypatch.setattr("mempalace.recall_llm._call_llm", fake_call_llm)
+
+    provider.on_turn_start(0, "user message", session_id="session-1")
+    provider.sync_turn(
+        "user message",
+        "assistant reply that is substantial enough",
+        session_id="session-1",
+    )
+
+    provider.shutdown()
+
+    # Verify the dump file was written
+    hook_state_dir = provider.resolved_paths.base_dir / "hook_state"
+    dump_files = list(hook_state_dir.glob("hermes_save_fail_*.txt"))
+    assert len(dump_files) >= 1, f"Expected failure dump file, found: {list(hook_state_dir.iterdir()) if hook_state_dir.exists() else '(dir missing)'}"
+    content = dump_files[0].read_text(encoding="utf-8")
+    assert "ERROR:" in content
+    assert "PROMPT" in content
+    assert "RAW RESPONSE" in content
+
+
+def test_recall_filtered_search_retries_without_filters_on_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When filtered search returns 0 hits, retry without filters."""
+    provider = _provider(tmp_path / "profile")
+    provider.on_turn_start(0, "find diary", session_id="session-1")
+    provider._sessions["session-1"].last_assistant_reply = ""
+
+    call_count = {"n": 0}
+
+    def fake_search_memories(**kwargs):
+        call_count["n"] += 1
+        if kwargs.get("room") == "diary":
+            return {"results": []}  # filtered search: empty
+        return {
+            "results": [
+                {"wing": "wing_default", "room": "general", "text": "Fallback result"}
+            ]
+        }
+
+    def fake_decide_recall(query, config=None, previous_assistant_context=None, active_context=None):
+        return {
+            "should_recall": True,
+            "reason": "history_reference",
+            "query": "diary entries",
+            "after": None,
+            "filters": {"room": "diary"},
+        }
+
+    def fake_build_active_context(self_arg, state):
+        return {
+            "wing": state.wing,
+            "platform": state.platform,
+            "palace": {"rooms": ["diary", "general"], "halls": []},
+        }
+
+    monkeypatch.setattr(mempalace_plugin, "search_memories", fake_search_memories)
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr("mempalace.recall_llm._get_llm_config", lambda: {"backend": "stub"})
+    monkeypatch.setattr("mempalace.recall_llm.decide_recall", fake_decide_recall)
+    monkeypatch.setattr(
+        mempalace_plugin.MemPalaceMemoryProvider,
+        "_build_recall_active_context",
+        fake_build_active_context,
+    )
+
+    recall = provider.prefetch("find diary", session_id="session-1")
+
+    assert "## MemPalace Recall" in recall
+    assert "Fallback result" in recall
+    # search_memories should have been called twice: once with filter, once without
+    assert call_count["n"] == 2
+    provider.shutdown()
+
+
+def test_on_session_end_flushes_buffered_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """on_session_end runs Haiku save on remaining buffered turns."""
+    monkeypatch.setenv("MEMPAL_HERMES_SAVE_INTERVAL", "99")  # no periodic trigger
+    monkeypatch.setenv("MEMPAL_RECALL_LLM", "1")
+
+    provider = _provider(tmp_path / "profile")
+
+    fixed_json = json.dumps({
+        "diary": "Session-end flush test diary entry for testing.",
+        "drawers": [{"wing": "wing_coder", "room": "general", "content": "Session-end drawer content for test purposes."}],
+        "kg": [],
+    })
+
+    def fake_call_llm(config, prompt, max_tokens=None, timeout=None, json_mode=False):
+        return fixed_json
+
+    monkeypatch.setattr("mempalace.recall_llm.is_enabled", lambda: True)
+    monkeypatch.setattr(
+        "mempalace.recall_llm._get_llm_config",
+        lambda: {"backend": "stub", "model": "h", "key": "k", "endpoint": "e"},
+    )
+    monkeypatch.setattr("mempalace.recall_llm._call_llm", fake_call_llm)
+
+    # 2 turns — won't trigger periodic save at interval=99
+    for i in range(2):
+        provider.on_turn_start(i, f"message {i}", session_id="session-1")
+        provider.sync_turn(
+            f"message {i}",
+            f"reply {i} which is long enough for substance",
+            session_id="session-1",
+        )
+
+    # Buffer should be non-empty
+    assert len(provider._sessions["session-1"].recent_turns) == 2
+
+    # Provide a minimal messages list for on_session_end (under threshold
+    # for auto_diary but still triggers Haiku flush).
+    provider.on_session_end([
+        {"role": "user", "content": "message 0"},
+        {"role": "assistant", "content": "reply 0"},
+    ])
+
+    collection = _get_collection(provider.resolved_paths.palace_path)
+    stored = collection.get(include=["metadatas"])
+    haiku_entries = [
+        m for m in stored["metadatas"] if m.get("added_by") == "haiku_async_save"
+    ]
+    assert len(haiku_entries) >= 1, "on_session_end should have flushed buffered turns"

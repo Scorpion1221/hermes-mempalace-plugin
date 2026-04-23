@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -94,6 +95,13 @@ CONTEXTUAL_FOLLOWUP_MESSAGES = frozenset({
     "continue", "go", "go on", "next", "继续",
 })
 HARD_SKIP_USER_MESSAGES = TRIVIAL_USER_MESSAGES - CONTEXTUAL_FOLLOWUP_MESSAGES
+
+# --- Haiku periodic save -------------------------------------------------
+# Trigger an LLM-extracted save every N non-trivial turns. Matches the
+# behaviour of mempalace.hooks_cli._async_save_worker for Claude Code.
+DEFAULT_HERMES_SAVE_INTERVAL = 3
+MAX_RECENT_TURNS_BUFFER = 20  # bound the in-memory transcript buffer
+SAVE_FAILURE_DUMP_PREFIX = "hermes_save_fail_"
 
 ALL_TOOL_NAMES = [
     "mempalace_search",
@@ -616,6 +624,10 @@ class SessionState:
     pending_write_futures: List[Future[Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     memories_filed: int = 0
+    # Recent (user, assistant) exchanges accumulated since the last
+    # Haiku-extracted save. Drained when len >= save interval. Always
+    # accessed under ``lock``.
+    recent_turns: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +785,21 @@ def _bounded_int(raw: Any, default: int, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(lo, min(value, hi))
+
+
+def _get_save_interval() -> int:
+    """Resolve the Haiku save trigger interval from env (MEMPAL_HERMES_SAVE_INTERVAL).
+
+    Minimum 1 turn. Defaults to ``DEFAULT_HERMES_SAVE_INTERVAL``.
+    """
+    raw = os.environ.get("MEMPAL_HERMES_SAVE_INTERVAL", "")
+    if not raw:
+        return DEFAULT_HERMES_SAVE_INTERVAL
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_HERMES_SAVE_INTERVAL
+    return max(1, value)
 
 
 # ---------------------------------------------------------------------------
@@ -1026,26 +1053,55 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         state = self._get_session_state(session_id)
-        if state is None or not state.allow_writes:
+        if state is None:
             return
         cleaned_assistant = _strip_injected_memory(assistant_content)
         with state.lock:
             state.last_assistant_reply = cleaned_assistant
         self._write_assistant_cache(state.session_id, cleaned_assistant)
+
+        if not state.allow_writes:
+            logger.warning(
+                "sync_turn: writes disabled for session=%s (agent_context=%s); "
+                "skipping periodic save",
+                state.session_id,
+                state.agent_context,
+            )
+            return
+
         if _is_trivial_turn(user_content, assistant_content):
             return
 
+        cleaned_user = _strip_injected_memory(user_content)
+
+        # Accumulate recent turns in-memory; when we hit the save interval,
+        # hand them to the Haiku extractor. Bounded buffer so a stuck LLM
+        # never blows memory.
+        save_interval = _get_save_interval()
         with state.lock:
             if state.turn_number < 0:
                 state.turn_number = 0
-            turn_number = state.turn_number
+            state.recent_turns.append(
+                {
+                    "user": cleaned_user,
+                    "assistant": cleaned_assistant,
+                    "ts": datetime.now().isoformat(),
+                }
+            )
+            if len(state.recent_turns) > MAX_RECENT_TURNS_BUFFER:
+                # Drop the oldest turns, keep the most recent. This should
+                # never trigger in normal flow (save_interval runs first)
+                # but guards against a stuck LLM leaking memory.
+                state.recent_turns = state.recent_turns[-MAX_RECENT_TURNS_BUFFER:]
+            should_flush = len(state.recent_turns) >= save_interval
+
+        if not should_flush:
+            return
 
         future = self._executor.submit(
-            self._write_turn_drawer,
+            self._haiku_save_recent_turns,
             state,
-            turn_number,
-            user_content,
-            assistant_content,
+            "periodic",
         )
         with state.lock:
             state.pending_write_futures.append(future)
@@ -1076,8 +1132,21 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not session_id:
             return
 
-        # --- Auto-diary: write a natural language session summary ---
+        # --- Haiku flush: extract whatever turns are still buffered so a
+        # session that ends between trigger boundaries doesn't lose them.
+        # Uses the same code path as the periodic trigger, so behaviour
+        # stays consistent.
         state = self._sessions.get(session_id)
+        if state is not None and state.allow_writes:
+            with state.lock:
+                has_pending = bool(state.recent_turns)
+            if has_pending:
+                try:
+                    self._haiku_save_recent_turns(state, "session_end")
+                except Exception as exc:  # pragma: no cover - best-effort
+                    logger.warning("hermes-haiku-save: final flush failed: %s", exc)
+
+        # --- Auto-diary: write a natural language session summary ---
         if state and state.allow_writes and messages and len(messages) > 2:
             try:
                 self._auto_diary(state, messages)
@@ -1989,16 +2058,27 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if previous_assistant_tail:
             search_query = f"{previous_assistant_tail}\n\n{query}"
         time_after = None
+        rewrite_filters: Dict[str, str] = {}
         try:
             from mempalace.recall_llm import is_enabled, _get_llm_config, decide_recall, rerank
             if is_enabled():
                 llm_config = _get_llm_config()
             if llm_config:
+                # Build active_context with palace taxonomy + top KG entities
+                # so the recall gate can (a) rewrite the query to echo
+                # canonical entity names and (b) propose valid filter values.
+                # Merge our Hermes-specific hints (wing, platform) on top.
+                active_ctx = self._build_recall_active_context(state)
+                taxonomy = (
+                    active_ctx.get("palace")
+                    if isinstance(active_ctx, dict)
+                    else {}
+                ) or {}
                 recall_decision = decide_recall(
                     query,
                     config=llm_config,
                     previous_assistant_context={"tail": previous_assistant_tail},
-                    active_context={"wing": state.wing, "platform": state.platform},
+                    active_context=active_ctx,
                 )
                 if recall_decision:
                     if not recall_decision.get("should_recall"):
@@ -2009,11 +2089,31 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         return ""
                     search_query = recall_decision["query"]
                     time_after = recall_decision.get("after")
+                    # Validate LLM-suggested filters against the real
+                    # palace taxonomy so we never filter to an empty
+                    # result set with a hallucinated room/hall name.
+                    raw_filters = recall_decision.get("filters") or {}
+                    valid_rooms = (
+                        set(taxonomy.get("rooms", [])) if taxonomy else set()
+                    )
+                    valid_halls = (
+                        set(taxonomy.get("halls", [])) if taxonomy else set()
+                    )
+                    raw_room = raw_filters.get("room")
+                    if raw_room and (not valid_rooms or raw_room in valid_rooms):
+                        rewrite_filters["room"] = raw_room
+                    raw_hall = raw_filters.get("hall")
+                    if raw_hall and (not valid_halls or raw_hall in valid_halls):
+                        rewrite_filters["hall"] = raw_hall
+                    raw_wing = raw_filters.get("wing")
+                    if raw_wing:
+                        rewrite_filters["wing"] = raw_wing
                     logger.info(
-                        "Recall: LLM decided recall reason=%s, query=%r, after=%s",
+                        "Recall: LLM decided recall reason=%s, query=%r, after=%s, filters=%s",
                         recall_decision.get("reason", "unknown"),
                         search_query[:80],
                         time_after,
+                        rewrite_filters or "none",
                     )
                 else:
                     from mempalace.recall_llm import _HISTORY_REFERENCE_HINTS
@@ -2042,15 +2142,44 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return ""
 
         pool_size = RECALL_POOL if llm_config else limit
-        result = search_memories(
-            query=search_query,
-            palace_path=str(self._paths.palace_path),
-            wing=None,  # search all wings for broader recall
-            preferred_wing=state.wing,  # soft-boost results from the active wing
-            n_results=pool_size,
-            after=time_after,
-        )
+        # Forward validated filters into the searcher. ``rewrite_filters.wing``
+        # only overrides the global (None) wing; otherwise we rely on
+        # ``preferred_wing`` for soft-boosting hits from the active wing.
+        search_kwargs: Dict[str, Any] = {
+            "query": search_query,
+            "palace_path": str(self._paths.palace_path),
+            "wing": rewrite_filters.get("wing"),
+            "preferred_wing": state.wing,
+            "n_results": pool_size,
+            "after": time_after,
+        }
+        if rewrite_filters.get("room"):
+            search_kwargs["room"] = rewrite_filters["room"]
+        if rewrite_filters.get("hall"):
+            search_kwargs["hall"] = rewrite_filters["hall"]
+
+        result = search_memories(**search_kwargs)
         hits = result.get("results", []) if isinstance(result, dict) else []
+
+        # Defensive retry: if the (validated-but-still-empty) filter killed
+        # the result set, drop the filters and search again. Mirrors the
+        # Claude Code hook behaviour — better to return broader hits than
+        # nothing.
+        if rewrite_filters and not hits:
+            logger.info(
+                "Recall: filtered search returned 0 hits, retrying without filters=%s",
+                rewrite_filters,
+            )
+            fallback_kwargs = {
+                "query": search_query,
+                "palace_path": str(self._paths.palace_path),
+                "wing": None,
+                "preferred_wing": state.wing,
+                "n_results": pool_size,
+                "after": time_after,
+            }
+            result = search_memories(**fallback_kwargs)
+            hits = result.get("results", []) if isinstance(result, dict) else []
 
         # Filter out diary entries — session summaries pollute auto-recall
         hits = [h for h in hits if h.get("room") != "diary"]
@@ -2085,24 +2214,372 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 lines.append(f"- [{room}] {snippet}")
         return "\n".join(lines)
 
-    def _write_turn_drawer(
-        self,
-        state: SessionState,
-        turn_number: int,
-        user_content: str,
-        assistant_content: str,
-    ) -> None:
-        room = "general"
-        drawer_id = self._turn_drawer_id(state.wing, state.session_id, turn_number, room)
-        cleaned_user = _strip_injected_memory(user_content)
-        cleaned_assistant = _strip_injected_memory(assistant_content)
-        document = (
-            "[role: user]\n"
-            f"{cleaned_user}\n\n"
-            "[role: assistant]\n"
-            f"{cleaned_assistant}"
-        ).strip()
-        self._upsert_drawer(drawer_id, document, room, state, turn_number=turn_number)
+    def _build_recall_active_context(self, state: SessionState) -> Any:
+        """Assemble the ``active_context`` payload for the recall gate.
+
+        Combines Claude Code's palace/entities enrichment (via
+        :func:`mempalace.hooks_cli._build_active_context`) with the
+        Hermes-specific session hints (``wing``, ``platform``). When the
+        palace has nothing indexed yet and no KG entities exist, falls
+        back to the original minimal shape so the gate prompt stays
+        predictable for empty palaces.
+        """
+        wing_hint: Dict[str, str] = {
+            "wing": state.wing,
+            "platform": state.platform,
+        }
+        if self._paths is None:
+            return wing_hint
+        cwd = str(self._paths.palace_path.parent)
+        palace_path = str(self._paths.palace_path)
+        try:
+            from mempalace.hooks_cli import _build_active_context
+
+            enriched = _build_active_context(cwd, palace_path)
+        except Exception as exc:  # pragma: no cover - defensive logging.
+            logger.debug("active_context enrichment failed: %s", exc)
+            return wing_hint
+        # _build_active_context returns either a plain cwd string (nothing
+        # to enrich) or a dict with {cwd, palace?, entities?}. Promote it
+        # to a dict either way so we can merge our hints.
+        if isinstance(enriched, dict):
+            enriched = dict(enriched)
+        else:
+            enriched = {"cwd": str(enriched)}
+        enriched.update(wing_hint)
+        return enriched
+
+    def _haiku_save_recent_turns(self, state: SessionState, trigger: str) -> int:
+        """Extract key knowledge from buffered turns via Haiku and write it.
+
+        Mirrors ``mempalace.hooks_cli._async_save_worker``:
+          1. Drain the turn buffer atomically so concurrent saves don't
+             double-write.
+          2. Format the transcript and call the LLM with
+             ``_ASYNC_SAVE_PROMPT``, JSON mode on.
+          3. Parse the response with ``_extract_first_json_object``. On
+             failure dump prompt + response to
+             ``$HERMES_HOME/mempalace/hook_state/hermes_save_fail_<ts>.txt``
+             for post-mortem.
+          4. Upsert each drawer, write the diary entry, add KG triples.
+
+        Returns the number of drawers + diary entries written (KG facts
+        are counted separately in the log line).
+        """
+        if self._paths is None:
+            return 0
+
+        with state.lock:
+            if not state.recent_turns:
+                return 0
+            turns = list(state.recent_turns)
+            state.recent_turns = []
+
+        if not state.allow_writes:
+            logger.warning(
+                "hermes-haiku-save: writes disabled mid-save (session=%s, trigger=%s); "
+                "dropping %d buffered turns",
+                state.session_id,
+                trigger,
+                len(turns),
+            )
+            return 0
+
+        # Skip trivial batches — Haiku call is expensive and there's
+        # nothing worth extracting from a pile of greetings.
+        meaningful = [
+            t
+            for t in turns
+            if not _is_trivial_turn(t.get("user", ""), t.get("assistant", ""))
+        ]
+        if not meaningful:
+            logger.info(
+                "hermes-haiku-save: no meaningful turns (session=%s, trigger=%s)",
+                state.session_id,
+                trigger,
+            )
+            return 0
+
+        try:
+            from mempalace.recall_llm import _get_llm_config, _call_llm, is_enabled
+        except ImportError:
+            logger.warning("hermes-haiku-save: recall_llm not importable; skipping")
+            return 0
+
+        if not is_enabled():
+            logger.info(
+                "hermes-haiku-save: LLM recall disabled (MEMPAL_RECALL_LLM not set); "
+                "buffered %d turns for session=%s trigger=%s not persisted",
+                len(meaningful),
+                state.session_id,
+                trigger,
+            )
+            return 0
+
+        config = _get_llm_config()
+        if not config:
+            logger.warning(
+                "hermes-haiku-save: no LLM config; dropping %d buffered turns "
+                "(session=%s, trigger=%s)",
+                len(meaningful),
+                state.session_id,
+                trigger,
+            )
+            return 0
+
+        try:
+            from mempalace.hooks_cli import (
+                _ASYNC_SAVE_PROMPT,
+                _build_palace_context,
+                _extract_first_json_object,
+            )
+        except ImportError as exc:
+            logger.warning("hermes-haiku-save: hooks_cli helpers missing (%s); skipping", exc)
+            return 0
+
+        # Build alternating user:/assistant: transcript (same shape as
+        # _extract_recent_exchanges yields for the Claude Code worker).
+        transcript_lines: List[str] = []
+        for turn in meaningful:
+            u = (turn.get("user") or "").strip()
+            a = (turn.get("assistant") or "").strip()
+            if u:
+                transcript_lines.append(f"> {u[:2000]}")
+            if a:
+                transcript_lines.append(a[:4000])
+        transcript_text = "\n\n".join(transcript_lines)
+        if not transcript_text:
+            return 0
+
+        wing = state.wing or "general"
+        prompt = _ASYNC_SAVE_PROMPT.format(wing=wing, transcript=transcript_text)
+        try:
+            palace_ctx = _build_palace_context()
+        except Exception as exc:  # pragma: no cover - best-effort
+            logger.debug("hermes-haiku-save: palace context build failed: %s", exc)
+            palace_ctx = ""
+        if palace_ctx:
+            prompt = prompt.replace(
+                "## Conversation to process:",
+                (
+                    "## Current Palace State (reuse existing wings/rooms/entities "
+                    "when possible):\n"
+                    f"{palace_ctx}\n\n"
+                    "## Conversation to process:"
+                ),
+            )
+
+        try:
+            response = _call_llm(config, prompt, max_tokens=16000, timeout=30, json_mode=True)
+        except Exception as exc:
+            logger.warning(
+                "hermes-haiku-save: LLM call raised (%s); session=%s trigger=%s",
+                exc,
+                state.session_id,
+                trigger,
+            )
+            return 0
+
+        if not response:
+            logger.info(
+                "hermes-haiku-save: LLM returned empty response (session=%s, trigger=%s)",
+                state.session_id,
+                trigger,
+            )
+            return 0
+
+        try:
+            candidate = _extract_first_json_object(response)
+            if candidate is None:
+                raise ValueError("no balanced JSON object in LLM response")
+            data = json.loads(candidate)
+        except (ValueError, json.JSONDecodeError) as exc:
+            dump_path = self._dump_save_failure(prompt, response, exc)
+            logger.warning(
+                "hermes-haiku-save: JSON parse failed (%s); raw dumped to %s",
+                exc,
+                dump_path or "<dump failed>",
+            )
+            return 0
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "hermes-haiku-save: parsed JSON is not an object (type=%s)",
+                type(data).__name__,
+            )
+            return 0
+
+        now = datetime.now()
+        n_drawers = 0
+        n_kg = 0
+
+        # --- Diary entry ---
+        diary = str(data.get("diary") or "").strip()
+        if len(diary) > 20:
+            diary_id = (
+                f"diary_haiku_{_slug(state.agent_identity or wing)}_"
+                f"{now.strftime('%Y%m%d_%H%M%S%f')}_"
+                f"{hashlib.sha256(diary.encode('utf-8')).hexdigest()[:12]}"
+            )
+            try:
+                self._upsert_drawer(
+                    diary_id,
+                    _safe_content(diary),
+                    "diary",
+                    state,
+                    wing_override=wing,
+                    extra_metadata={
+                        "hall": "hall_diary",
+                        "topic": "auto-save",
+                        "type": "diary_entry",
+                        "agent": "haiku",
+                        "date": now.strftime("%Y-%m-%d"),
+                    },
+                    added_by="haiku_async_save",
+                )
+                n_drawers += 1
+            except Exception as exc:  # pragma: no cover - ChromaDB should be stable.
+                logger.warning("hermes-haiku-save: diary upsert failed: %s", exc)
+
+        # --- Drawers ---
+        try:
+            from mempalace.miner import detect_hall
+        except ImportError:
+            detect_hall = None  # type: ignore
+
+        drawers = data.get("drawers") or []
+        if not isinstance(drawers, list):
+            drawers = []
+        for drawer in drawers:
+            if not isinstance(drawer, dict):
+                continue
+            content = str(drawer.get("content") or "").strip()
+            if len(content) < 20:
+                continue
+            d_wing = _safe_wing_name(str(drawer.get("wing") or wing))
+            d_room = _safe_room_name(drawer.get("room"), "general")
+            d_hall = drawer.get("hall")
+            if not d_hall and detect_hall is not None:
+                try:
+                    d_hall = detect_hall(content)
+                except Exception:
+                    d_hall = None
+            drawer_id = self._content_drawer_id(d_wing, d_room, content)
+            try:
+                extra_meta: Dict[str, Any] = {}
+                if d_hall:
+                    extra_meta["hall"] = d_hall
+                self._upsert_drawer(
+                    drawer_id,
+                    _safe_content(content),
+                    d_room,
+                    state,
+                    wing_override=d_wing,
+                    extra_metadata=extra_meta,
+                    added_by="haiku_async_save",
+                )
+                n_drawers += 1
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "hermes-haiku-save: drawer upsert failed (%s): %s",
+                    drawer_id,
+                    exc,
+                )
+
+        # --- KG triples ---
+        kg_facts = data.get("kg") or []
+        if isinstance(kg_facts, list) and kg_facts and KnowledgeGraph is not None:
+            try:
+                kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
+            except Exception as exc:
+                logger.warning("hermes-haiku-save: KG open failed: %s", exc)
+                kg = None
+            if kg is not None:
+                try:
+                    today_iso = now.strftime("%Y-%m-%d")
+                    for fact in kg_facts:
+                        if not isinstance(fact, dict):
+                            continue
+                        subj = str(fact.get("subject") or "").strip()
+                        pred = str(fact.get("predicate") or "").strip()
+                        obj = str(fact.get("object") or "").strip()
+                        if not (subj and pred and obj):
+                            continue
+                        try:
+                            # Invalidate stale single-valued facts (same
+                            # subject/predicate, different object) — matches
+                            # the hooks_cli worker behaviour.
+                            try:
+                                existing = kg.query_entity(subj, direction="outgoing")
+                            except Exception:
+                                existing = []
+                            for old in existing or []:
+                                if (
+                                    old.get("predicate") == pred
+                                    and old.get("object") != obj
+                                    and old.get("valid_to") is None
+                                ):
+                                    try:
+                                        kg.invalidate(subj, pred, old["object"], ended=today_iso)
+                                    except Exception:
+                                        pass
+                            kg.add_triple(subj, pred, obj, valid_from=today_iso)
+                            n_kg += 1
+                        except Exception as exc:
+                            logger.debug(
+                                "hermes-haiku-save: KG triple failed (%s/%s/%s): %s",
+                                subj,
+                                pred,
+                                obj,
+                                exc,
+                            )
+                finally:
+                    try:
+                        kg.close()
+                    except Exception:
+                        pass
+
+        with state.lock:
+            state.memories_filed += n_drawers
+
+        total = n_drawers + n_kg
+        logger.info(
+            "hermes-haiku-save: wrote %d entries (%d drawers + %d kg facts) "
+            "for session %s trigger=%s",
+            total,
+            n_drawers,
+            n_kg,
+            state.session_id,
+            trigger,
+        )
+        return total
+
+    def _dump_save_failure(self, prompt: str, response: str, exc: Exception) -> Optional[Path]:
+        """Persist the prompt + LLM response when JSON parsing fails.
+
+        Dumps under ``<base_dir>/hook_state/hermes_save_fail_<ts>.txt`` so
+        the caller has a single stable file to inspect after a bad run.
+        Returns the written path, or ``None`` if the dump itself failed.
+        """
+        if self._paths is None:
+            return None
+        dump_dir = self._paths.base_dir / "hook_state"
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S%f")
+            dump_path = dump_dir / f"{SAVE_FAILURE_DUMP_PREFIX}{ts}.txt"
+            dump_path.write_text(
+                (
+                    f"ERROR: {exc}\n\n"
+                    f"=== PROMPT (first 2KB) ===\n{prompt[:2048]}\n\n"
+                    f"=== RAW RESPONSE ===\n{response}"
+                ),
+                encoding="utf-8",
+            )
+            return dump_path
+        except OSError as io_exc:
+            logger.warning("hermes-haiku-save: dump write failed: %s", io_exc)
+            return None
 
     def _upsert_drawer(
         self,
@@ -2113,15 +2590,17 @@ class MemPalaceMemoryProvider(MemoryProvider):
         *,
         turn_number: Optional[int] = None,
         wing_override: Optional[str] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+        added_by: str = "hermes-mempalace",
     ) -> None:
         collection = self._get_collection(create=True)
         wing = wing_override or state.wing
-        metadata = {
+        metadata: Dict[str, Any] = {
             "wing": wing,
             "room": room,
             "source_file": "",
             "chunk_index": 0,
-            "added_by": "hermes-mempalace",
+            "added_by": added_by,
             "filed_at": datetime.now().isoformat(),
             "session_id": state.session_id,
             "turn_number": int(turn_number if turn_number is not None else state.turn_number),
@@ -2130,7 +2609,31 @@ class MemPalaceMemoryProvider(MemoryProvider):
             "agent_identity": state.agent_identity,
             "agent_context": state.agent_context,
         }
-        collection.upsert(ids=[drawer_id], documents=[content], metadatas=[metadata])
+        if extra_metadata:
+            # Filter None values — Chroma rejects them — and let the caller
+            # override sensible defaults like "hall" or "type".
+            for key, value in extra_metadata.items():
+                if value is None:
+                    continue
+                metadata[key] = value
+        try:
+            collection.upsert(ids=[drawer_id], documents=[content], metadatas=[metadata])
+            logger.debug(
+                "hermes-mempalace: upserted drawer=%s wing=%s room=%s added_by=%s",
+                drawer_id,
+                wing,
+                room,
+                added_by,
+            )
+        except Exception as exc:
+            logger.warning(
+                "hermes-mempalace: upsert failed (drawer=%s wing=%s room=%s): %s",
+                drawer_id,
+                wing,
+                room,
+                exc,
+            )
+            raise
 
     def _get_collection(self, *, create: bool):
         if chromadb is None or self._paths is None:
