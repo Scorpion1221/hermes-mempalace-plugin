@@ -65,7 +65,6 @@ except ImportError:  # pragma: no cover - local workspace fallback.
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BASE_DIR_NAME = "mempalace"
 CONFIG_FILE_NAME = "mempalace.json"
 WRITE_BLOCKED_CONTEXTS = {"subagent", "cron", "flush"}
@@ -96,7 +95,7 @@ CONTEXTUAL_FOLLOWUP_MESSAGES = frozenset({
 })
 HARD_SKIP_USER_MESSAGES = TRIVIAL_USER_MESSAGES - CONTEXTUAL_FOLLOWUP_MESSAGES
 
-# --- Haiku periodic save -------------------------------------------------
+# --- LLM periodic save -------------------------------------------------
 # Trigger an LLM-extracted save every N non-trivial turns. Matches the
 # behaviour of mempalace.hooks_cli._async_save_worker for Claude Code.
 DEFAULT_HERMES_SAVE_INTERVAL = 3
@@ -625,7 +624,7 @@ class SessionState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     memories_filed: int = 0
     # Recent (user, assistant) exchanges accumulated since the last
-    # Haiku-extracted save. Drained when len >= save interval. Always
+    # LLM-extracted save. Drained when len >= save interval. Always
     # accessed under ``lock``.
     recent_turns: List[Dict[str, str]] = field(default_factory=list)
 
@@ -788,7 +787,7 @@ def _bounded_int(raw: Any, default: int, lo: int, hi: int) -> int:
 
 
 def _get_save_interval() -> int:
-    """Resolve the Haiku save trigger interval from env (MEMPAL_HERMES_SAVE_INTERVAL).
+    """Resolve the LLM save trigger interval from env (MEMPAL_HERMES_SAVE_INTERVAL).
 
     Minimum 1 turn. Defaults to ``DEFAULT_HERMES_SAVE_INTERVAL``.
     """
@@ -821,7 +820,6 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self._agent_identity = ""
         self._platform = "cli"
         self._user_id = ""
-        self._chroma_client: Any = None
         self._chroma_lock = threading.Lock()
         self._cached_config: Optional[Dict[str, Any]] = None
 
@@ -1075,7 +1073,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         cleaned_user = _strip_injected_memory(user_content)
 
         # Accumulate recent turns in-memory; when we hit the save interval,
-        # hand them to the Haiku extractor. Bounded buffer so a stuck LLM
+        # hand them to the LLM extractor. Bounded buffer so a stuck LLM
         # never blows memory.
         save_interval = _get_save_interval()
         with state.lock:
@@ -1099,7 +1097,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return
 
         future = self._executor.submit(
-            self._haiku_save_recent_turns,
+            self._async_llm_save_recent_turns,
             state,
             "periodic",
         )
@@ -1132,7 +1130,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not session_id:
             return
 
-        # --- Haiku flush: extract whatever turns are still buffered so a
+        # --- LLM flush: extract whatever turns are still buffered so a
         # session that ends between trigger boundaries doesn't lose them.
         # Uses the same code path as the periodic trigger, so behaviour
         # stays consistent.
@@ -1142,9 +1140,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 has_pending = bool(state.recent_turns)
             if has_pending:
                 try:
-                    self._haiku_save_recent_turns(state, "session_end")
+                    self._async_llm_save_recent_turns(state, "session_end")
                 except Exception as exc:  # pragma: no cover - best-effort
-                    logger.warning("hermes-haiku-save: final flush failed: %s", exc)
+                    logger.warning("hermes-llm-save: final flush failed: %s", exc)
 
         # --- Auto-diary: write a natural language session summary ---
         if state and state.allow_writes and messages and len(messages) > 2:
@@ -1226,7 +1224,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         now_ts: str,
         state: "SessionState",
     ) -> str:
-        """Use Haiku to write a natural language diary entry. Returns empty on failure."""
+        """Use the recall LLM to write a natural language diary entry. Returns empty on failure."""
         try:
             from mempalace.recall_llm import is_enabled, _get_llm_config, _call_llm
         except ImportError:
@@ -1339,7 +1337,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         """Write a natural language diary entry summarising the session.
 
         Two-tier approach:
-        1. LLM (Haiku) — produces high-quality natural language summary
+        1. LLM (recall model) — produces high-quality natural language summary
            in the user's language for best vector search recall.
         2. Regex fallback — pure extraction when LLM is unavailable.
         """
@@ -1480,7 +1478,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
         for session_id in list(self._sessions):
             self._flush_session(session_id)
         self._executor.shutdown(wait=True, cancel_futures=False)
-        self._chroma_client = None
+        try:
+            from mempalace.palace import _DEFAULT_BACKEND as _palace_backend
+            _palace_backend.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Tool handlers
@@ -1918,7 +1920,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
     def _tool_reconnect(self, state: SessionState, args: Dict) -> str:
         with self._chroma_lock:
-            self._chroma_client = None
+            # Drop cached PersistentClient inside mempalace backend so it
+            # reopens with any fresh settings on next access.
+            try:
+                from mempalace.palace import _DEFAULT_BACKEND as _palace_backend
+                _palace_backend.close()
+            except Exception:
+                pass
             # Clear ChromaDB's global singleton registry so PersistentClient
             # can be re-created with fresh settings (avoids "different settings" error).
             try:
@@ -2249,8 +2257,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         enriched.update(wing_hint)
         return enriched
 
-    def _haiku_save_recent_turns(self, state: SessionState, trigger: str) -> int:
-        """Extract key knowledge from buffered turns via Haiku and write it.
+    def _async_llm_save_recent_turns(self, state: SessionState, trigger: str) -> int:
+        """Extract key knowledge from buffered turns via the recall LLM and write it.
 
         Mirrors ``mempalace.hooks_cli._async_save_worker``:
           1. Drain the turn buffer atomically so concurrent saves don't
@@ -2277,7 +2285,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         if not state.allow_writes:
             logger.warning(
-                "hermes-haiku-save: writes disabled mid-save (session=%s, trigger=%s); "
+                "hermes-llm-save: writes disabled mid-save (session=%s, trigger=%s); "
                 "dropping %d buffered turns",
                 state.session_id,
                 trigger,
@@ -2285,7 +2293,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             )
             return 0
 
-        # Skip trivial batches — Haiku call is expensive and there's
+        # Skip trivial batches — LLM call is expensive and there's
         # nothing worth extracting from a pile of greetings.
         meaningful = [
             t
@@ -2294,7 +2302,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         ]
         if not meaningful:
             logger.info(
-                "hermes-haiku-save: no meaningful turns (session=%s, trigger=%s)",
+                "hermes-llm-save: no meaningful turns (session=%s, trigger=%s)",
                 state.session_id,
                 trigger,
             )
@@ -2303,12 +2311,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         try:
             from mempalace.recall_llm import _get_llm_config, _call_llm, is_enabled
         except ImportError:
-            logger.warning("hermes-haiku-save: recall_llm not importable; skipping")
+            logger.warning("hermes-llm-save: recall_llm not importable; skipping")
             return 0
 
         if not is_enabled():
             logger.info(
-                "hermes-haiku-save: LLM recall disabled (MEMPAL_RECALL_LLM not set); "
+                "hermes-llm-save: LLM recall disabled (MEMPAL_RECALL_LLM not set); "
                 "buffered %d turns for session=%s trigger=%s not persisted",
                 len(meaningful),
                 state.session_id,
@@ -2319,7 +2327,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         config = _get_llm_config()
         if not config:
             logger.warning(
-                "hermes-haiku-save: no LLM config; dropping %d buffered turns "
+                "hermes-llm-save: no LLM config; dropping %d buffered turns "
                 "(session=%s, trigger=%s)",
                 len(meaningful),
                 state.session_id,
@@ -2334,7 +2342,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 _extract_first_json_object,
             )
         except ImportError as exc:
-            logger.warning("hermes-haiku-save: hooks_cli helpers missing (%s); skipping", exc)
+            logger.warning("hermes-llm-save: hooks_cli helpers missing (%s); skipping", exc)
             return 0
 
         # Build alternating user:/assistant: transcript (same shape as
@@ -2356,7 +2364,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         try:
             palace_ctx = _build_palace_context()
         except Exception as exc:  # pragma: no cover - best-effort
-            logger.debug("hermes-haiku-save: palace context build failed: %s", exc)
+            logger.debug("hermes-llm-save: palace context build failed: %s", exc)
             palace_ctx = ""
         if palace_ctx:
             prompt = prompt.replace(
@@ -2373,7 +2381,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             response = _call_llm(config, prompt, max_tokens=16000, timeout=30, json_mode=True)
         except Exception as exc:
             logger.warning(
-                "hermes-haiku-save: LLM call raised (%s); session=%s trigger=%s",
+                "hermes-llm-save: LLM call raised (%s); session=%s trigger=%s",
                 exc,
                 state.session_id,
                 trigger,
@@ -2382,7 +2390,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         if not response:
             logger.info(
-                "hermes-haiku-save: LLM returned empty response (session=%s, trigger=%s)",
+                "hermes-llm-save: LLM returned empty response (session=%s, trigger=%s)",
                 state.session_id,
                 trigger,
             )
@@ -2396,7 +2404,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         except (ValueError, json.JSONDecodeError) as exc:
             dump_path = self._dump_save_failure(prompt, response, exc)
             logger.warning(
-                "hermes-haiku-save: JSON parse failed (%s); raw dumped to %s",
+                "hermes-llm-save: JSON parse failed (%s); raw dumped to %s",
                 exc,
                 dump_path or "<dump failed>",
             )
@@ -2404,7 +2412,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         if not isinstance(data, dict):
             logger.warning(
-                "hermes-haiku-save: parsed JSON is not an object (type=%s)",
+                "hermes-llm-save: parsed JSON is not an object (type=%s)",
                 type(data).__name__,
             )
             return 0
@@ -2439,7 +2447,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 )
                 n_drawers += 1
             except Exception as exc:  # pragma: no cover - ChromaDB should be stable.
-                logger.warning("hermes-haiku-save: diary upsert failed: %s", exc)
+                logger.warning("hermes-llm-save: diary upsert failed: %s", exc)
 
         # --- Drawers ---
         try:
@@ -2481,7 +2489,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 n_drawers += 1
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
-                    "hermes-haiku-save: drawer upsert failed (%s): %s",
+                    "hermes-llm-save: drawer upsert failed (%s): %s",
                     drawer_id,
                     exc,
                 )
@@ -2492,7 +2500,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             try:
                 kg = KnowledgeGraph(db_path=str(self._paths.kg_path))
             except Exception as exc:
-                logger.warning("hermes-haiku-save: KG open failed: %s", exc)
+                logger.warning("hermes-llm-save: KG open failed: %s", exc)
                 kg = None
             if kg is not None:
                 try:
@@ -2527,7 +2535,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                             n_kg += 1
                         except Exception as exc:
                             logger.debug(
-                                "hermes-haiku-save: KG triple failed (%s/%s/%s): %s",
+                                "hermes-llm-save: KG triple failed (%s/%s/%s): %s",
                                 subj,
                                 pred,
                                 obj,
@@ -2544,7 +2552,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         total = n_drawers + n_kg
         logger.info(
-            "hermes-haiku-save: wrote %d entries (%d drawers + %d kg facts) "
+            "hermes-llm-save: wrote %d entries (%d drawers + %d kg facts) "
             "for session %s trigger=%s",
             total,
             n_drawers,
@@ -2578,7 +2586,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             )
             return dump_path
         except OSError as io_exc:
-            logger.warning("hermes-haiku-save: dump write failed: %s", io_exc)
+            logger.warning("hermes-llm-save: dump write failed: %s", io_exc)
             return None
 
     def _upsert_drawer(
@@ -2640,30 +2648,27 @@ class MemPalaceMemoryProvider(MemoryProvider):
             if create:
                 raise RuntimeError("MemPalace provider is unavailable")
             return None
-        with self._chroma_lock:
-            if self._chroma_client is None:
-                import os
-                os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-                try:
-                    self._chroma_client = chromadb.PersistentClient(
-                        path=str(self._paths.palace_path),
-                    )
-                except ValueError:
-                    # ChromaDB singleton conflict — clear global cache and retry.
-                    try:
-                        from chromadb.api.shared_system_client import SharedSystemClient
-                        SharedSystemClient.clear_system_cache()
-                    except Exception:
-                        pass
-                    self._chroma_client = chromadb.PersistentClient(
-                        path=str(self._paths.palace_path),
-                    )
-        if create:
-            return self._chroma_client.get_or_create_collection(COLLECTION_NAME)
+        # Delegate to mempalace.palace.get_collection so the collection is
+        # bound to the configured MEMPAL_EMBEDDING_* function (Gemini 3072-dim
+        # via LiteLLM by default). A locally-constructed PersistentClient would
+        # default to ChromaDB's built-in MiniLM (384-dim) and every upsert
+        # would fail with a silent dimension mismatch against an existing
+        # palace.
         try:
-            return self._chroma_client.get_collection(COLLECTION_NAME)
-        except Exception:
+            from mempalace.palace import get_collection as _palace_get_collection
+        except ImportError:
+            logger.warning("mempalace.palace unavailable; cannot get collection")
             return None
+        try:
+            return _palace_get_collection(str(self._paths.palace_path), create=create)
+        except ValueError:
+            # ChromaDB singleton conflict — clear global cache and retry.
+            try:
+                from chromadb.api.shared_system_client import SharedSystemClient
+                SharedSystemClient.clear_system_cache()
+            except Exception:
+                pass
+            return _palace_get_collection(str(self._paths.palace_path), create=create)
 
     def _assistant_cache_dir(self) -> Path:
         if self._paths is None:
