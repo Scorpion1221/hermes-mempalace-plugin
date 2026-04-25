@@ -674,7 +674,21 @@ def resolve_paths(hermes_home: str | Path) -> ResolvedPaths:
             logger.warning("Could not read %s: %s", config_path, exc)
 
     base_dir = hermes_home_path / DEFAULT_BASE_DIR_NAME
-    palace_path = _resolve_optional_path(config_values.get("palace_path"), base_dir / "palace", hermes_home_path)
+    # Palace and KG default to the SHARED mempalace store (~/.mempalace/...)
+    # so Claude Code, Codex, and Hermes all read/write the same memory on this
+    # machine. A user can still override per-Hermes-profile by setting
+    # palace_path / kg_path explicitly in mempalace_config.json — useful for
+    # testing — but the default is shared, not profile-scoped.
+    try:
+        from mempalace.config import DEFAULT_PALACE_PATH as _SHARED_PALACE_PATH
+        from mempalace.knowledge_graph import DEFAULT_KG_PATH as _SHARED_KG_PATH
+        _shared_palace_default = Path(_SHARED_PALACE_PATH)
+        _shared_kg_default = Path(_SHARED_KG_PATH)
+    except ImportError:
+        _shared_palace_default = base_dir / "palace"
+        _shared_kg_default = base_dir / "knowledge_graph.sqlite3"
+
+    palace_path = _resolve_optional_path(config_values.get("palace_path"), _shared_palace_default, hermes_home_path)
     identity_path = _resolve_optional_path(
         config_values.get("identity_path"),
         base_dir / "identity.txt",
@@ -682,7 +696,7 @@ def resolve_paths(hermes_home: str | Path) -> ResolvedPaths:
     )
     kg_path = _resolve_optional_path(
         config_values.get("kg_path"),
-        base_dir / "knowledge_graph.sqlite3",
+        _shared_kg_default,
         hermes_home_path,
     )
     return ResolvedPaths(
@@ -1987,8 +2001,15 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if config_wing:
             wing = _safe_wing_name(config_wing)
         else:
+            # Default Hermes wing is the user's own slug — a neutral "personal"
+            # wing for content that doesn't clearly belong to a project. The
+            # async save LLM is encouraged (via _ASYNC_SAVE_PROMPT) to override
+            # this per-drawer when the conversation is clearly about a project
+            # that already has a wing in the palace (e.g. mempalace, solvely_web).
+            # No "wing_" prefix — matches Claude Code/Codex naming convention so
+            # cross-agent searches don't fragment.
             wing_seed = user_id or agent_identity or session_id or self._paths.hermes_home.name
-            wing = _safe_wing_name(f"wing_{_slug(wing_seed)}")
+            wing = _safe_wing_name(_slug(wing_seed))
 
         with state.lock:
             state.wing = wing
@@ -2115,7 +2136,26 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         rewrite_filters["hall"] = raw_hall
                     raw_wing = raw_filters.get("wing")
                     if raw_wing:
-                        rewrite_filters["wing"] = raw_wing
+                        # Mirror hooks_cli wing validation: accept only when
+                        # the candidate matches preferred_wing (session-default)
+                        # or is present in the palace's known wings. This
+                        # blocks hallucinated wing names that would filter
+                        # every result away.
+                        valid_wings = (
+                            set(taxonomy.get("wings", [])) if taxonomy else set()
+                        )
+                        if raw_wing == state.wing or (
+                            valid_wings and raw_wing in valid_wings
+                        ):
+                            rewrite_filters["wing"] = raw_wing
+                        else:
+                            logger.info(
+                                "Recall: dropping unknown wing %r "
+                                "(preferred=%r, known=%s)",
+                                raw_wing,
+                                state.wing,
+                                sorted(valid_wings),
+                            )
                     logger.info(
                         "Recall: LLM decided recall reason=%s, query=%r, after=%s, filters=%s",
                         recall_decision.get("reason", "unknown"),
@@ -2169,25 +2209,61 @@ class MemPalaceMemoryProvider(MemoryProvider):
         result = search_memories(**search_kwargs)
         hits = result.get("results", []) if isinstance(result, dict) else []
 
-        # Defensive retry: if the (validated-but-still-empty) filter killed
-        # the result set, drop the filters and search again. Mirrors the
-        # Claude Code hook behaviour — better to return broader hits than
-        # nothing.
+        # Two-stage fallback when the filtered search returns 0 hits.
+        # Mirrors mempalace.hooks_cli (commit c23af9f) — wing is a
+        # project-scoping signal that must NOT be widened, otherwise we
+        # cross-project contaminate the recall. room/hall are narrower
+        # hints and may be relaxed.
         if rewrite_filters and not hits:
-            logger.info(
-                "Recall: filtered search returned 0 hits, retrying without filters=%s",
-                rewrite_filters,
-            )
-            fallback_kwargs = {
-                "query": search_query,
-                "palace_path": str(self._paths.palace_path),
-                "wing": None,
-                "preferred_wing": state.wing,
-                "n_results": pool_size,
-                "after": time_after,
-            }
-            result = search_memories(**fallback_kwargs)
-            hits = result.get("results", []) if isinstance(result, dict) else []
+            wing_filter = rewrite_filters.get("wing")
+            narrower = {k: v for k, v in rewrite_filters.items() if k != "wing"}
+            if wing_filter and narrower:
+                logger.info(
+                    "Recall: filtered search returned 0 hits, "
+                    "widening within wing=%r (dropping %s)",
+                    wing_filter,
+                    sorted(narrower),
+                )
+                stage2_kwargs = {
+                    "query": search_query,
+                    "palace_path": str(self._paths.palace_path),
+                    "wing": wing_filter,
+                    "preferred_wing": state.wing,
+                    "n_results": pool_size,
+                    "after": time_after,
+                }
+                result = search_memories(**stage2_kwargs)
+                hits = result.get("results", []) if isinstance(result, dict) else []
+                if not hits:
+                    logger.info(
+                        "Recall: no hits for wing=%r; returning empty recall "
+                        "(refusing to cross-project contaminate)",
+                        wing_filter,
+                    )
+                    return ""
+            elif wing_filter:
+                logger.info(
+                    "Recall: no hits for wing=%r; returning empty recall",
+                    wing_filter,
+                )
+                return ""
+            else:
+                # No wing filter — safe to fully widen (likely a
+                # hallucinated room/hall label).
+                logger.info(
+                    "Recall: filtered search returned 0 hits, retrying without filters=%s",
+                    rewrite_filters,
+                )
+                fallback_kwargs = {
+                    "query": search_query,
+                    "palace_path": str(self._paths.palace_path),
+                    "wing": None,
+                    "preferred_wing": state.wing,
+                    "n_results": pool_size,
+                    "after": time_after,
+                }
+                result = search_memories(**fallback_kwargs)
+                hits = result.get("results", []) if isinstance(result, dict) else []
 
         # Filter out diary entries — session summaries pollute auto-recall
         hits = [h for h in hits if h.get("room") != "diary"]
@@ -2424,9 +2500,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # --- Diary entry ---
         diary = str(data.get("diary") or "").strip()
         if len(diary) > 20:
+            # Match Claude Code/Codex diary id template (mempalace.hooks_cli:911)
+            # so identical diary text from any agent on this machine produces
+            # the same id and upsert dedups instead of double-storing.
             diary_id = (
-                f"diary_haiku_{_slug(state.agent_identity or wing)}_"
-                f"{now.strftime('%Y%m%d_%H%M%S%f')}_"
+                f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
                 f"{hashlib.sha256(diary.encode('utf-8')).hexdigest()[:12]}"
             )
             try:
