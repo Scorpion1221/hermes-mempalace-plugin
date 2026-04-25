@@ -1,4 +1,28 @@
-# hermes-mempalace-plugin
+# hermes-mempalace-plugin (ARCHIVED — moved 2026-04-25)
+
+**This repository has been merged into the main MemPalace repo** at
+[`Scorpion1221/mempalace`](https://github.com/Scorpion1221/mempalace)
+under `integrations/hermes/`.
+
+The Hermes plugin imports directly from `mempalace.recall_llm`,
+`mempalace.palace`, and `mempalace.hooks_cli`, so every cross-cutting
+change had to land atomically on both repos. Keeping them separate
+made coordinated refactors error-prone. They now share one commit,
+one push, one deploy.
+
+## Where to go
+
+- **Plugin code**: `~/git/mempalace/integrations/hermes/plugins/memory/mempalace/`
+- **Tests**: `~/git/mempalace/integrations/hermes/tests/`
+- **Deploy**: `bash ~/git/mempalace/scripts/sync-plugins.sh`
+
+## Old content
+
+The files in this repo are the state at commit `c6b7f80` (2026-04-25).
+They stay here as a historical reference only — all new work happens in
+the merged repo.
+
+---
 
 Development workspace for a Hermes Agent memory provider backed by MemPalace.
 
