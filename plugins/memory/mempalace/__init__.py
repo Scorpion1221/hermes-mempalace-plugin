@@ -2265,8 +2265,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 result = search_memories(**fallback_kwargs)
                 hits = result.get("results", []) if isinstance(result, dict) else []
 
-        # Filter out diary entries — session summaries pollute auto-recall
-        hits = [h for h in hits if h.get("room") != "diary"]
+        # Note: diary entries are NOT filtered out (parity with
+        # mempalace.hooks_cli.py:1671). The async save now stores valuable
+        # personal facts (e.g. "user has three cats") as diary entries too;
+        # let the reranker decide relevance instead of stripping diary
+        # blindly.
 
         if not hits:
             return ""
@@ -2521,7 +2524,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
                         "agent": "haiku",
                         "date": now.strftime("%Y-%m-%d"),
                     },
-                    added_by="haiku_async_save",
+                    # No added_by="haiku_async_save" on diary — matches
+                    # Claude Code/Codex (mempalace.hooks_cli:902-916 omits it).
+                    # The added_by tag is reserved for drawer-content entries
+                    # and is what _build_palace_context queries to show
+                    # "Recent saves" — diary entries should NOT pollute that
+                    # dedup signal.
                 )
                 n_drawers += 1
             except Exception as exc:  # pragma: no cover - ChromaDB should be stable.
